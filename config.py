@@ -1,0 +1,12 @@
+IMAGE_PATH = "test/02.jpg"
+MODEL_PATH = "models/manga_panel_detector_fp32.pt"
+OUTPUT_DIR = "output"
+
+CONFIDENCE = 0.25
+PANEL_CLASS_ID = 0
+
+DARK_PIXEL_THRESHOLD = 100
+DARK_RATIO_THRESHOLD = 0.05
+TRIM_MARGIN = 2
+
+JPEG_QUALITY = 95
