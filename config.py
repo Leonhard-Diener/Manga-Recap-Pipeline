@@ -1,4 +1,6 @@
-IMAGE_PATH = "test/02.jpg"
+''' Panel Extraction Settings '''
+
+INPUT_DIR = "input"
 MODEL_PATH = "models/manga_panel_detector_fp32.pt"
 OUTPUT_DIR = "output"
 
@@ -11,6 +13,12 @@ TRIM_MARGIN = 2
 
 JPEG_QUALITY = 95
 
+# Manga is read right-to-left; set to False for Western left-to-right comics
 READING_ORDER_RTL = True
 # Minimum vertical overlap ratio for two panels to be considered part of the same row
 ROW_OVERLAP_THRESHOLD = 0.5
+
+
+
+''' Downloader settings '''
+BASE_URL = "https://api.mangadex.org/manga"
