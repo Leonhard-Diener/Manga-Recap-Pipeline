@@ -3,6 +3,7 @@ import config
 import os
 from PIL import Image
 from image_utils import trim_white_border
+from reading_order import sort_reading_order
 from dataclasses import dataclass
 
 
@@ -33,10 +34,17 @@ def extract_panels(image_path: str) -> list:
     model = YOLO(config.MODEL_PATH)
     boxes = detect_panels(model, image_path)
 
-    panels = []
-    for i, box in enumerate(boxes):
-        x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
+    # Collect raw detections as (x1, y1, x2, y2, confidence) tuples
+    detections = [
+        (*(int(v) for v in box.xyxy[0].tolist()), float(box.conf[0]))
+        for box in boxes
+    ]
 
+    # Reorder by reading order before assigning file names, so filenames match reading sequence
+    ordered_detections = sort_reading_order(detections, box_key=lambda d: d[:4])
+
+    panels = []
+    for i, (x1, y1, x2, y2, confidence) in enumerate(ordered_detections):
         panel_image = trim_white_border(image.crop((x1, y1, x2, y2)))
 
         output_path = os.path.join(config.OUTPUT_DIR, f"{i + 1}.jpg")
@@ -45,7 +53,7 @@ def extract_panels(image_path: str) -> list:
         panels.append(Panel(
             index=i + 1,
             box=(x1, y1, x2, y2),
-            confidence=float(box.conf[0]),
+            confidence=confidence,
             output_path=output_path,
         ))
 

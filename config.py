@@ -10,3 +10,7 @@ DARK_RATIO_THRESHOLD = 0.05
 TRIM_MARGIN = 2
 
 JPEG_QUALITY = 95
+
+READING_ORDER_RTL = True
+# Minimum vertical overlap ratio for two panels to be considered part of the same row
+ROW_OVERLAP_THRESHOLD = 0.5
