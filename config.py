@@ -1,7 +1,7 @@
 ''' Panel Extraction Settings '''
 
 INPUT_DIR = "input"
-MODEL_PATH = "models/manga_panel_detector_fp32.pt"
+MODEL_PATH = "models/best.pt"
 OUTPUT_DIR = "output"
 
 CONFIDENCE = 0.25
