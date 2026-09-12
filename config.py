@@ -53,7 +53,7 @@ MAX_CONTENT_EXPANSION_RATIO = 0.15
 
 # Export.
 JPEG_QUALITY = 95
-SAVE_DEBUG = True
+SAVE_DEBUG = False
 
 ''' Downloader settings '''
 BASE_URL = "https://api.mangadex.org/manga"

@@ -26,6 +26,7 @@ def deduplicate(
         duplicate = any(
             iou(candidate.box, existing.box) >= iou_threshold
             or containment(candidate.box, existing.box) >= containment_threshold
+            or containment(existing.box, candidate.box) >= containment_threshold
             for existing in kept
         )
         if duplicate:
@@ -174,6 +175,7 @@ def final_nested_cleanup(
     for candidate_box, candidate_source in ordered:
         if any(
             containment(candidate_box, kept_box) >= containment_threshold
+            or containment(kept_box, candidate_box) >= containment_threshold
             for kept_box, _ in kept
         ):
             removed += 1

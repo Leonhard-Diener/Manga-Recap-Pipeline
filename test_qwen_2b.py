@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 from transformers import (
     AutoProcessor,
-    AutoModelForMultimodalLM,
+    AutoModelForCausalLM,
 )
 
 
@@ -578,7 +578,7 @@ def main():
         max_pixels=512 * 28 * 28,
     )
 
-    model = AutoModelForMultimodalLM.from_pretrained(
+    model = AutoModelForCausalLM.from_pretrained(
         MODEL_PATH,
         device_map="auto",
         dtype=torch.float16,

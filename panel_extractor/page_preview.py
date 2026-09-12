@@ -5,9 +5,10 @@ output directory so it never overwrites panel crops or debug images.
 
 Reading order
 -------------
-Manga pages are read right-to-left, top-to-bottom.  Panels are first grouped
-into rows by checking whether their vertical centres overlap (with a small
-tolerance band), then sorted right-to-left within each row.
+Manga pages are read right-to-left, top-to-bottom.  Panels are grouped into
+rows using a 30% vertical-overlap threshold (applied to either panel's height),
+with transitive grouping via union-find.  Rows are then sorted top-to-bottom
+and panels within each row right-to-left by x1.
 """
 
 from __future__ import annotations
@@ -30,62 +31,165 @@ _LABEL_FG = (255, 255, 255)         # white text
 _LABEL_PAD = 10                     # pixels of padding inside the badge
 _FONT_SIZE = 36                     # points for the panel number
 
-# Two panels are considered to be in the same row when their vertical overlap
-# covers at least this fraction of the smaller panel's height.
-_ROW_OVERLAP_RATIO = 0.5
-
 
 # ── reading-order sort ────────────────────────────────────────────────────────
 
-def _manga_reading_order(boxes: list[np.ndarray]) -> list[int]:
-    """Return panel indices sorted in manga reading order (right-to-left, top-to-bottom).
 
-    Row grouping uses vertical overlap rather than centre-distance so that a
-    tall panel spanning multiple small panels on the opposite side is not
-    incorrectly merged into one of those rows.  Two panels are considered to be
-    in the same row when they share at least ``_ROW_OVERLAP_RATIO`` of the
-    smaller panel's height as vertical overlap.
+def _manga_reading_order(boxes: list[np.ndarray]) -> list[int]:
+    """Return panel indices in manga reading order.
+
+    Manga is read from right to left and then from top to bottom.
+
+    Panels are grouped into rows by transitive vertical-overlap: two
+    panels belong to the same row if their vertical extents overlap by
+    at least 30% of the shorter panel's height, and row membership is
+    transitive (union-find), so a chain of panels connects into one row
+    even if no single pair perfectly aligns. This also correctly
+    handles a tall panel that spans several stacked panels, e.g.:
+
+        +-------------+-------------+
+        |      2      |      1      |
+        |             |             |
+        +-------------+             |
+        |      3      |             |
+        |             |             |
+        +-------------+-------------+
+
+    which is one row (1, 2 and 3 all overlap panel 1's height), read as
+    1 -> 2 -> 3: right to left by each panel's left edge, and top to
+    bottom as a tie-break for panels stacked in the same column.
+
+    Rows themselves are then sorted top-to-bottom by their topmost edge.
+
+    Note: an earlier version of this function used a step-by-step
+    nearest-neighbour walk instead of this row grouping. That approach
+    re-evaluated "is this the same row?" relative to whichever panel it
+    had *just* visited rather than to the row as a whole. If that panel
+    happened to be short (e.g. a thin strip panel), the row-overlap
+    test — 30% of the *shorter* panel's height — became very strict for
+    its neighbours, so a tall panel one column over could fail to
+    register as "same row" and be misclassified as a lower row. Once
+    misclassified, it competed for a "closest row" slot against
+    unrelated panels and could keep losing, ending up read far later
+    than it should have been — occasionally dead last. Grouping rows
+    transitively up front avoids this entirely: row membership no
+    longer depends on which panel happened to be visited right before it.
     """
+
     if not boxes:
         return []
 
-    # Work with (original_index, x_centre, y1, y2) tuples.
-    items = [
-        (i, (b[0] + b[2]) * 0.5, float(b[1]), float(b[3]))
-        for i, b in enumerate(boxes)
-    ]
-    # Process top-to-bottom by the top edge of each panel.
-    items.sort(key=lambda c: c[2])
+    panels = []
 
-    # Each row stores (original_index, cx, y1, y2) and tracks its own y-span.
-    rows: list[list[tuple[int, float, float, float]]] = []
-    row_spans: list[tuple[float, float]] = []   # (row_y1, row_y2) for each row
+    for index, box in enumerate(boxes):
+        x1, y1, x2, y2 = map(float, box[:4])
 
-    for idx, cx, y1, y2 in items:
-        h = max(1.0, y2 - y1)
-        placed = False
-        for r_idx, (row_y1, row_y2) in enumerate(row_spans):
-            # Vertical overlap between this panel and the current row span.
-            overlap = max(0.0, min(y2, row_y2) - max(y1, row_y1))
-            row_h = max(1.0, row_y2 - row_y1)
-            # Belongs to the row if overlap covers enough of the smaller height.
-            if overlap / min(h, row_h) >= _ROW_OVERLAP_RATIO:
-                rows[r_idx].append((idx, cx, y1, y2))
-                # Expand the row's y-span to include this panel.
-                row_spans[r_idx] = (min(row_y1, y1), max(row_y2, y2))
-                placed = True
-                break
-        if not placed:
-            rows.append([(idx, cx, y1, y2)])
-            row_spans.append((y1, y2))
+        if x2 < x1:
+            x1, x2 = x2, x1
+        if y2 < y1:
+            y1, y2 = y2, y1
+
+        panels.append(
+            {
+                "index": index,
+                "x1": x1,
+                "y1": y1,
+                "x2": x2,
+                "y2": y2,
+                "h": max(1.0, y2 - y1),
+            }
+        )
+
+    n = len(panels)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i: int, j: int) -> None:
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    def same_vertical_band(a: dict, b: dict) -> bool:
+        """Check whether two panels occupy approximately the same vertical band."""
+
+        overlap = max(0.0, min(a["y2"], b["y2"]) - max(a["y1"], b["y1"]))
+
+        if overlap <= 0:
+            return False
+
+        return overlap / min(a["h"], b["h"]) >= 0.30
+
+    # Union every pair of panels that share a vertical band. Transitive
+    # via union-find, so a chain of overlapping panels ends up in one
+    # row even without every pair overlapping each other directly.
+    for i in range(n):
+        for j in range(i + 1, n):
+            if same_vertical_band(panels[i], panels[j]):
+                union(i, j)
+
+    rows: dict[int, list[dict]] = {}
+    for i, panel in enumerate(panels):
+        rows.setdefault(find(i), []).append(panel)
+
+    ordered_rows = sorted(rows.values(), key=lambda row: min(p["y1"] for p in row))
 
     result: list[int] = []
-    for row in rows:
-        # Within each row sort right-to-left by x centre.
-        row.sort(key=lambda c: -c[1])
-        result.extend(c[0] for c in row)
+
+    for row in ordered_rows:
+        if not row:
+            continue
+
+        # Group panels that occupy approximately the same horizontal column.
+        # Small x-offsets are common in AI detections and should not change
+        # the vertical reading order of stacked panels.
+        widths = [p["x2"] - p["x1"] for p in row]
+
+        column_tolerance = max(
+            10.0,
+            np.median(widths) * 0.10,
+        )
+
+        columns: list[list[dict]] = []
+
+        # Build loose vertical columns from left-edge positions.
+        for panel in sorted(row, key=lambda p: p["x1"]):
+            placed = False
+
+            for column in columns:
+                reference_x = np.mean([p["x1"] for p in column])
+
+                if abs(panel["x1"] - reference_x) <= column_tolerance:
+                    column.append(panel)
+                    placed = True
+                    break
+
+            if not placed:
+                columns.append([panel])
+
+        # Manga reads columns from right to left.
+        columns.sort(
+            key=lambda column: max(p["x2"] for p in column),
+            reverse=True,
+        )
+
+        for column in columns:
+            # Panels stacked in the same column are read top-to-bottom.
+            column.sort(key=lambda p: p["y1"])
+
+            result.extend(
+                p["index"]
+                for p in column
+            )
 
     return result
+
+
+
 
 
 # ── font helper ───────────────────────────────────────────────────────────────
