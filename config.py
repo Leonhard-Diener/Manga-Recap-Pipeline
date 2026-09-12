@@ -24,6 +24,23 @@ MINIMUM_PANEL_RATIO = 0.05
 DUPLICATE_IOU = 0.80
 DUPLICATE_CONTAINMENT = 0.90
 
+# ── Post-processing step toggles ──────────────────────────────────────────────
+# Set any flag to False to disable that specific post-processing step entirely.
+# Useful for diagnosing which step causes wrong panel areas.
+
+# Remove overlapping / near-identical panel detections after inference (and
+# after the tiled fallback if it runs).
+ENABLE_DEDUPLICATION = True
+
+# Discard panels whose area is smaller than MINIMUM_PANEL_RATIO × page area.
+ENABLE_SMALL_PANEL_FILTER = True
+
+# Expand panel boxes to include text / body content that crosses the boundary.
+ENABLE_CONTENT_PROTECTION = False
+
+# Final pass that drops crops almost completely contained by another crop.
+ENABLE_NESTED_CLEANUP = True
+
 # Content protection. These values only affect a panel when detected content
 # actually crosses the panel boundary.
 TEXT_PADDING_X = 0.10
@@ -40,3 +57,11 @@ SAVE_DEBUG = True
 
 ''' Downloader settings '''
 BASE_URL = "https://api.mangadex.org/manga"
+# Download all chapters or only the first chapter
+DOWNLOAD_ALL_CHAPTERS = True
+
+# MangaLMM visual understanding. This separate VLM only classifies complete
+# downloaded pages; it does not detect, crop, or modify panels.
+MANGA_LMM_MODEL_ID = "Qwen/Qwen2.5-VL-3B-Instruct"
+MANGA_LMM_DEVICE_MAP = "auto"
+MANGA_LMM_CACHE_DIR = Path("./models")

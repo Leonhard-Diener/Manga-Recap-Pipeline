@@ -30,11 +30,39 @@ python download_model.py
 
 ```bash
 pip install -r requirements.txt
-python main3.py
+python main.py "Manga title"
 ```
 
-Input pages go in `input/`.
-All crops go directly into `output/`.
+`main.py` downloads the selected MangaDex chapters, asks MangaLMM whether the
+pages directly at each chapter's start and end are story pages, deletes only
+the surrounding credits/shoutouts/end cards, then passes the remaining pages
+to the existing panel extractor. It never crops or changes the source pages'
+panels during recognition.
+
+MangaLMM is downloaded automatically from Hugging Face into `models/MangaLMM/`
+on the first run. It is an 8B visual-language model, so a GPU with sufficient
+VRAM is strongly recommended. The same model is exposed through
+`MangaLMMRecognizer` in `manga_recognizer.py` for later panel descriptions and
+character/action analysis.
+
+To download only the first chapter:
+
+```bash
+python main.py "Manga title" --no-all-chapters
+```
+
+Check your real downloaded page directory with MangaLMM (without changing a
+file) using:
+
+```bash
+python test_main.py
+```
+
+After reviewing its list, delete the detected credits/end pages with:
+
+```bash
+python test_main.py --apply
+```
 
 ## Debug colors
 

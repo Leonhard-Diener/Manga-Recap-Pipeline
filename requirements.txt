@@ -2,3 +2,5 @@ numpy
 Pillow
 onnxruntime
 huggingface_hub
+requests
+transformers[torch]>=4.52.0

@@ -3,7 +3,6 @@ import os
 import time
 
 import httpx
-
 import config
 
 
@@ -18,7 +17,6 @@ async def _get_at_home_server(
     chapter_id: str,
 ):
     """Retrieve the MangaDex@Home server assigned to a chapter."""
-
     await asyncio.sleep(AT_HOME_INTERVAL)
 
     url = f"https://api.mangadex.org/at-home/server/{chapter_id}"
@@ -51,7 +49,6 @@ async def _get_at_home_server(
             continue
 
         response.raise_for_status()
-
         return response.json()
 
 
@@ -113,7 +110,7 @@ async def _download_image(
     return False
 
 
-def _write_file(path, content):
+def _write_file(path: str, content: bytes):
     """Write downloaded data without blocking the event loop."""
 
     with open(path, "wb") as file:
@@ -123,16 +120,33 @@ def _write_file(path, content):
 async def download_chapter(
     chapter_id: str,
     manga_name: str,
+    chapter_index: int,
 ):
-    """Download all pages of a chapter concurrently."""
+    """
+    Download all pages of one chapter concurrently.
+
+    Each chapter is stored in its own directory:
+        input/<manga_name>/chapter_001/
+        input/<manga_name>/chapter_002/
+        ...
+    """
+
+    # --------------------------------------------------------
+    # Create manga and chapter directories
+    # --------------------------------------------------------
 
     manga_folder = os.path.join(
         config.INPUT_DIR,
         manga_name,
     )
 
-    os.makedirs(
+    chapter_folder = os.path.join(
         manga_folder,
+        f"chapter_{chapter_index:03d}",
+    )
+
+    os.makedirs(
+        chapter_folder,
         exist_ok=True,
     )
 
@@ -148,33 +162,26 @@ async def download_chapter(
         },
     ) as client:
 
+        # ----------------------------------------------------
+        # Get MangaDex@Home server
+        # ----------------------------------------------------
+
         data = await _get_at_home_server(
             client,
             chapter_id,
         )
 
         base_url = data["baseUrl"]
-        chapter = data["chapter"]
 
+        chapter = data["chapter"]
         chapter_hash = chapter["hash"]
         page_filenames = chapter["data"]
 
         chapter_number = chapter.get("chapter")
 
-        if chapter_number:
-            chapter_name = f"Chapter {chapter_number}"
-        else:
-            chapter_name = f"Chapter {chapter_id}"
-
-        chapter_folder = os.path.join(
-            manga_folder,
-            chapter_name,
-        )
-
-        os.makedirs(
-            chapter_folder,
-            exist_ok=True,
-        )
+        # ----------------------------------------------------
+        # Create download tasks
+        # ----------------------------------------------------
 
         semaphore = asyncio.Semaphore(
             MAX_CONCURRENT_DOWNLOADS
@@ -182,7 +189,7 @@ async def download_chapter(
 
         tasks = []
 
-        for page_number, filename in enumerate(
+        for page_index, filename in enumerate(
             page_filenames,
             start=1,
         ):
@@ -196,7 +203,7 @@ async def download_chapter(
 
             image_path = os.path.join(
                 chapter_folder,
-                f"{page_number:03d}{extension}",
+                f"{page_index:05d}{extension}",
             )
 
             tasks.append(
@@ -208,6 +215,10 @@ async def download_chapter(
                 )
             )
 
+        # ----------------------------------------------------
+        # Download all pages
+        # ----------------------------------------------------
+
         results = await asyncio.gather(*tasks)
 
         downloaded = sum(results)
@@ -218,3 +229,5 @@ async def download_chapter(
             f"{downloaded} downloaded, "
             f"{skipped} skipped"
         )
+
+        return len(page_filenames)

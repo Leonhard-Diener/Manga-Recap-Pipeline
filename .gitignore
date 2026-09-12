@@ -1,0 +1,13 @@
+input/*
+output/*
+.vscode/
+__pycache__/
+
+models/*
+!models/.gitkeep
+
+input/*
+!input/.gitkeep
+
+output/*
+!output/.gitkeep
