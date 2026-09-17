@@ -1,0 +1,7 @@
+numpy
+Pillow
+onnxruntime
+huggingface_hub
+requests
+httpx
+transformers[torch]>=4.52.0
