@@ -1,70 +1,59 @@
-# RT-DETRv4-X Manga Panel Extractor
+# Manga Recap Pipeline
 
-A clean, modular implementation of the working RT-DETRv4-X Manga109-s panel extraction pipeline.
+Four steps, each runnable on its own or all together via `main.py`.
 
-## Pipeline
+1. **Download** (`downloader/`) — fetch chapters from MangaDex into
+   `input/<manga title>/chapter_XXX/`.
+2. **Cleanup** (`cleanup/`) — a small VLM classifies each page as
+   `MANGA`/`EXTRA` and deletes the credits/shoutout/intro pages at the
+   start and end of every chapter. Only edge pages are touched.
+3. **Panels** (`panel_extractor/`) — RT-DETR detects panels, crops them,
+   and writes numbered page previews (used later to know what each
+   number refers to on the page).
+4. **Description** (`description/`) — the same VLM describes each
+   numbered panel on every page preview from step 3.
 
-1. RT-DETRv4-X detects `body`, `text`, and `frame`.
-2. A page-level tiled fallback recovers panels when more than 35% of the page is not covered by frame detections.
-3. Duplicate frame detections are removed using IoU and containment checks.
-4. Panels below 5% of page area are discarded.
-5. Text and body detections may expand a frame only when the detected content actually crosses the frame boundary.
-6. A final nested-box check prevents duplicate exports.
-7. Crops are written directly to `output/` with global numbering.
-
-White-border trimming and recursive panel detection are intentionally not used.
-
-## Model
-
-Place the RT-DETRv4-X Manga109-s ONNX model at:
-
-`models/model.onnx`
-
-or run:
-
-```bash
-python download_model.py
-```
-
-## Run
+## Setup
 
 ```bash
 pip install -r requirements.txt
+python download_model.py        # RT-DETR ONNX model -> models/model.onnx
+```
+
+Place the Qwen3.5-2B model at `models/Qwen3.5-2B` (used for steps 2 and 4).
+
+## Run everything
+
+```bash
 python main.py "Manga title"
+python main.py "Manga title" --no-all-chapters   # only the first chapter
 ```
 
-`main.py` downloads the selected MangaDex chapters, asks MangaLMM whether the
-pages directly at each chapter's start and end are story pages, deletes only
-the surrounding credits/shoutouts/end cards, then passes the remaining pages
-to the existing panel extractor. It never crops or changes the source pages'
-panels during recognition.
+Each step's model is loaded once and reused across all chapters before
+moving to the next step.
 
-MangaLMM is downloaded automatically from Hugging Face into `models/MangaLMM/`
-on the first run. It is an 8B visual-language model, so a GPU with sufficient
-VRAM is strongly recommended. The same model is exposed through
-`MangaLMMRecognizer` in `manga_recognizer.py` for later panel descriptions and
-character/action analysis.
-
-To download only the first chapter:
+## Run one step at a time
 
 ```bash
-python main.py "Manga title" --no-all-chapters
+python test_download.py "Manga title"      # step 1
+python test_cleanup.py "Manga title"       # step 2 — deletes extra pages!
+python test_panels.py "Manga title"        # step 3
+python test_description.py "Manga title"   # step 4
 ```
 
-Check your real downloaded page directory with MangaLMM (without changing a
-file) using:
+The title argument is optional if `config.MANGA_TITLE` is set, or if
+`input/` already contains exactly one manga folder.
 
-```bash
-python test_main.py
+## Output layout
+
+```
+output/<manga title>/<chapter>/
+    panel_0001.jpg ...            # step 3 crops
+    page_previews/<page>.jpg      # step 3 numbered previews
+output/<manga title>_descriptions.json   # step 4
 ```
 
-After reviewing its list, delete the detected credits/end pages with:
-
-```bash
-python test_main.py --apply
-```
-
-## Debug colors
+## Debug colors (panel previews)
 
 - Orange: raw frame/panel detection
 - Magenta: text detection
