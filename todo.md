@@ -1,0 +1,4 @@
+- check where the names should come from. currently they need to be added manually
+- create the test_story_writer.py based on the .md file
+- add text to speech
+- combine thtat into a video

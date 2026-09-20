@@ -1,39 +1,57 @@
 """Step 4: describe what happens on each page, panel by panel.
 
-One complete manga page (the numbered preview from step 3) is analyzed in a
-single inference. The model replies with plain text:
-
-    PANEL 1: ...
-    PANEL 2: ...
-
-which is then parsed into JSON. No detections.json is required or produced
-by this step.
+One numbered page preview is analyzed in a single inference, returning both
+panel descriptions and proposed character events. This module returns data;
+callers decide whether to serialize it. No output files are written here.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import re
+import json
 import time
 from pathlib import Path
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-import torch
-from transformers import AutoModelForMultimodalLM, AutoProcessor
-
 import config
 from common.utils import list_images, move_to_device
+from description.response import parse_page_response
+from story_entities.manifest import file_hash
 
 PAGE_PROMPT = """\
-Analyze the image visually.
+Analyze this numbered manga page. Return exactly one JSON object:
+{"page_role": "story", "panels": [{"panel_number": 1, "description": "Characters: ... Location: ... Actions: ..."}],
+ "events": []}
 
-For each panel, output:
-PANEL N:
-Characters: ...
-Location: ...
-Actions: ...
+page_role must be story, reference (profiles or character sheets), extra (credits,
+covers, advertisements or decorative artwork), or uncertain. Retain and describe
+all numbered regions even on non-story pages. Do not treat a cover as a story event.
+
+Describe EVERY numbered panel briefly, including humans, humanoids, creatures,
+animals, dragons, demons, and other visible beings. Never filter for humans only.
+
+Also record possible character changes or related events visible on THIS page.
+Allowed event types: transformation, reversion, disguise_reveal, possession,
+summoning, splitting, fusion. Keep summoning and possession distinct from a
+character changing form; they do not prove two beings are the same character.
+
+For each event use exactly these fields:
+{"type": "transformation", "source_panel": 1, "target_panel": 2,
+ "source_description": "brief visible description of the being before the event",
+ "target_description": "brief visible description of the being after the event",
+ "evidence": "specific visible change or clearly readable text supporting the event",
+ "evidence_type": "visible_change"}
+
+evidence_type must be visible_change, explicit_text, or ambiguous_sequence.
+For explicit_text quote the short readable text. For ambiguous_sequence explain
+the uncertainty (for example, the creature could be a separate arrival).
+Both panel references must occur in panels. They may be the same panel if the
+change happens within one panel. Do not invent off-page endpoints.
+Return events: [] if no event is supported. Do not fabricate an event to fill
+the schema. Similar looks, a different facial expression, or two neighboring
+panels alone do not demonstrate transformation. Use local visual descriptions,
+not guessed names or canonical character IDs. These events are only proposals.
 
 Rules:
 - Describe every visible character or creature.
@@ -44,21 +62,19 @@ Rules:
 - Use only information directly visible in the image.
 - Do not guess names, identities, relationships, intentions, or story context.
 - Do not invent events.
-- Do not infer what happened before or after the scene.
+- Do not infer events on pages that were not supplied.
 - Only quote text that is clearly readable.
 - Keep each field concise.
 - No reasoning.
-- No JSON.
+- No markdown or text outside the JSON object.
 """
-
-_PANEL_HEADER = re.compile(
-    r"^\s*(?:[*_`#]+\s*)?PANEL\s+(\d+)\s*:?[ \t]*(?:[*_`#]+[ \t]*)?(.*)$",
-    re.IGNORECASE,
-)
 
 
 def load_describer():
     """Load the page-description model, processor, and run a warmup pass."""
+    import torch
+    from transformers import AutoModelForMultimodalLM, AutoProcessor
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available.")
 
@@ -81,6 +97,8 @@ def load_describer():
 
 def _warmup(processor, model) -> None:
     """Initialize CUDA/model kernels before real inference."""
+    import torch
+
     messages = [{"role": "user", "content": [{"type": "text", "text": "Reply with exactly: OK"}]}]
     inputs = processor.apply_chat_template(
         messages,
@@ -97,44 +115,23 @@ def _warmup(processor, model) -> None:
     torch.cuda.synchronize()
 
 
-def parse_response(response: str) -> dict[int, str]:
-    """Extract PANEL N descriptions from one-line or multiline model output."""
-    descriptions: dict[int, str] = {}
-    current_panel: int | None = None
-    current_lines: list[str] = []
-
-    def save_current() -> None:
-        if current_panel is None:
-            return
-        description = " ".join(" ".join(current_lines).split()).strip()
-        if description:
-            descriptions[current_panel] = description
-
-    for line in response.splitlines():
-        match = _PANEL_HEADER.match(line)
-        if match:
-            save_current()
-            current_panel = int(match.group(1))
-            current_lines = [match.group(2)] if match.group(2).strip() else []
-        elif current_panel is not None:
-            current_lines.append(line)
-
-    save_current()
-    return descriptions
-
-
 def describe_page(
     page_path: Path,
     processor,
     model,
-) -> tuple[dict[int, str], float, int, str]:
-    """Describe one page and return descriptions, time, token count, and raw output."""
+    *,
+    expected_panels=None,
+) -> dict:
+    """Return descriptions and proposed events from the same generation."""
+    import torch
+
     messages = [
         {
             "role": "user",
             "content": [
                 {"type": "image", "image": str(page_path.resolve())},
-                {"type": "text", "text": PAGE_PROMPT},
+                {"type": "text", "text": PAGE_PROMPT + (
+                    "\nExpected panel numbers: " + json.dumps(expected_panels) if expected_panels is not None else "")},
             ],
         }
     ]
@@ -175,54 +172,92 @@ def describe_page(
         clean_up_tokenization_spaces=False,
     ).strip()
 
-    return parse_response(response), elapsed, generated_tokens, response
+    result = parse_page_response(
+        response, truncated=generated_tokens >= config.DESCRIPTION_MAX_NEW_TOKENS,
+        expected_panels=expected_panels,
+    )
+    result.update(
+        generation_time=elapsed, generated_tokens=generated_tokens, raw_response=response
+    )
+    return result
 
 
 def describe_chapter(chapter_output_dir: Path, processor, model) -> dict[str, dict]:
     """Describe every numbered page preview of one chapter (step 3's output)."""
     preview_dir = chapter_output_dir / "page_previews"
     pages = list_images(preview_dir)
+    manifest_path = chapter_output_dir / "panel_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.is_file() else None
+    metadata = {Path(p["page"]).name: p for p in manifest["pages"]} if manifest else {}
+    if manifest is not None:
+        # Old previews from removed/replaced inputs must not re-enter the story.
+        by_name = {p.name: p for p in pages}
+        pages = [by_name[name] for name in metadata if name in by_name]
+        missing = set(metadata) - set(by_name)
+        if missing:
+            raise FileNotFoundError(f"Missing page previews; rerun test_panels.py: {sorted(missing)}")
 
-    results: dict[str, list[dict]] = {}
+    results: dict[str, dict] = {}
+    transformations: dict[str, dict] = {}
     for index, page_path in enumerate(pages, start=1):
         print(f"  Page {index}/{len(pages)}: {page_path.name}", flush=True)
-        descriptions, elapsed, generated_tokens, raw_response = describe_page(
-            page_path, processor, model
-        )
-        print(f"    Generate: {elapsed:.2f}s", flush=True)
+        source = metadata.get(page_path.name, {})
+        if source:
+            source_path = Path(source["page"])
+            if (not source_path.is_file() or file_hash(source_path) != source.get("source_hash")
+                    or (source.get("preview_hash") and file_hash(page_path) != source["preview_hash"])):
+                raise ValueError(f"Stale page preview/manifest: {page_path.name}; rerun test_panels.py.")
+            page = describe_page(page_path, processor, model,
+                                 expected_panels=[p["panel_number"] for p in source["panels"]])
+        else:
+            page = describe_page(page_path, processor, model)
+        print(f"    Generate: {page['generation_time']:.2f}s", flush=True)
         print(
-            f"    Tokens:   {generated_tokens}/{config.DESCRIPTION_MAX_NEW_TOKENS}",
+            f"    Tokens:   {page['generated_tokens']}/{config.DESCRIPTION_MAX_NEW_TOKENS}",
             flush=True,
         )
-        print(f"    Panels:   {len(descriptions)}", flush=True)
+        print(f"    Panels:   {len(page['panels'])}", flush=True)
+        print(f"    Events:   {len(page['events'])} ({page['status']})", flush=True)
 
-        for panel_number in sorted(descriptions):
+        for panel in page["panels"]:
             print(
-                f"    Panel {panel_number}: {descriptions[panel_number]}",
+                f"    Panel {panel['panel_number']}: {panel['description']}",
                 flush=True,
             )
 
-        if not descriptions:
-            print(f"    Raw output: {raw_response!r}", flush=True)
+        if page["status"] != "complete":
+            print(f"    Warning: {page['errors']}", flush=True)
 
         results[page_path.name] = {
-            "panels": [
-                {"panel_number": number, "description": descriptions[number]}
-                for number in sorted(descriptions)
-            ],
-            "generation_time": elapsed,
-            "generated_tokens": generated_tokens,
+            "page_role": page.get("page_role", "uncertain"),
+            "source_hash": source.get("source_hash"),
+            "geometry_revision": source.get("geometry_revision"),
+            "panels": page["panels"],
+            "generation_time": page["generation_time"],
+            "generated_tokens": page["generated_tokens"],
+            "extraction_status": page["status"],
         }
+        transformations[page_path.name] = {
+            "page_role": page.get("page_role", "uncertain"),
+            "source_hash": source.get("source_hash"),
+            "geometry_revision": source.get("geometry_revision"),
+            "page_id": source.get("page_id"),
+            "events": page["events"],
+            "extraction_status": page["status"],
+            "errors": page["errors"],
+        }
+        transformations[page_path.name]["raw_response"] = page["raw_response"]
 
-    return results
+    return {"descriptions": results, "transformations": transformations}
 
 
 def describe_manga(
     manga_output_dir: Path,
     chapter_dirs: list[Path],
-    output_file: Path,
-) -> None:
-    """Load the description model once and describe every chapter."""
+) -> dict:
+    """Return both manga-wide results without writing JSON or other artifacts."""
+    import torch
+
     print("Loading page-description model...")
     processor, model = load_describer()
     print("Model loaded.")
@@ -233,14 +268,19 @@ def describe_manga(
     print("Warmup complete.\n")
 
     all_results: dict[str, dict] = {}
+    transformations: dict[str, dict] = {}
     for chapter_dir in chapter_dirs:
         chapter_output_dir = manga_output_dir / chapter_dir.name
         print(f"Chapter: {chapter_dir.name}")
-        all_results[chapter_dir.name] = describe_chapter(chapter_output_dir, processor, model)
+        chapter = describe_chapter(chapter_output_dir, processor, model)
+        all_results[chapter_dir.name] = chapter["descriptions"]
+        transformations[chapter_dir.name] = chapter["transformations"]
 
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-    output_file.write_text(
-        json.dumps(all_results, indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    print(f"\nSaved descriptions to {output_file}")
+    return {
+        "descriptions": all_results,
+        "transformations": {
+            "schema_version": 1,
+            "scope": "within_page",
+            "chapters": transformations,
+        },
+    }

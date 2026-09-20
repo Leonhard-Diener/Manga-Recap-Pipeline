@@ -11,25 +11,132 @@ from .geometry import box_area, containment, intersection_area, iou
 from .types import Detection
 
 
+# A page-spanning frame is still useful diagnostic context, but containment is
+# resolved uniformly: a deeply nested frame is a duplicate/fragment regardless
+# of where it sits on the page.
+DEFAULT_BACKGROUND_RATIO = 0.90
+
+# Two boxes are considered to share an edge when the coordinates differ by no
+# more than this fraction of the larger box's width/height.
+DEFAULT_EDGE_TOLERANCE = 0.02
+
+# Shared edges required to conclude that two boxes are fragments of one panel.
+MIN_SHARED_EDGES = 3
+
+
+def union_box(first: np.ndarray, second: np.ndarray) -> np.ndarray:
+    """Return the smallest xyxy box covering both inputs."""
+    return np.array(
+        [
+            min(float(first[0]), float(second[0])),
+            min(float(first[1]), float(second[1])),
+            max(float(first[2]), float(second[2])),
+            max(float(first[3]), float(second[3])),
+        ],
+        dtype=np.float32,
+    )
+
+
+def _merged_detection(first: Detection, second: Detection) -> Detection:
+    """Combine two detections of the same panel into one union detection."""
+    if second.score > first.score:
+        first, second = second, first
+    return Detection(
+        union_box(first.box, second.box),
+        float(first.score),
+        int(first.class_id),
+    )
+
+
+def shared_edge_count(
+    first: np.ndarray,
+    second: np.ndarray,
+    tolerance: float = DEFAULT_EDGE_TOLERANCE,
+) -> int:
+    """Count how many of the four edges two boxes share approximately.
+
+    Detectors frequently return several partial boxes for one panel: e.g. the
+    full rectangle plus a left and a right fragment.  Those fragments inherit
+    three of the parent's edges, whereas two genuinely different overlapping
+    panels only align by accident.
+    """
+    tol_x = tolerance * max(
+        1.0,
+        float(first[2] - first[0]),
+        float(second[2] - second[0]),
+    )
+    tol_y = tolerance * max(
+        1.0,
+        float(first[3] - first[1]),
+        float(second[3] - second[1]),
+    )
+    shared = 0
+    for index, tol in ((0, tol_x), (2, tol_x), (1, tol_y), (3, tol_y)):
+        if abs(float(first[index]) - float(second[index])) <= tol:
+            shared += 1
+    return shared
+
+
+def _is_background(box: np.ndarray, page_area: int | None, ratio: float) -> bool:
+    return page_area is not None and box_area(box) / max(1, page_area) >= ratio
+
+
 def deduplicate(
     detections: Iterable[Detection],
     *,
     iou_threshold: float,
     containment_threshold: float,
+    page_area: int | None = None,
+    background_ratio: float = DEFAULT_BACKGROUND_RATIO,
+    edge_tolerance: float = DEFAULT_EDGE_TOLERANCE,
 ) -> tuple[list[Detection], int]:
-    """Remove duplicate detections while keeping the highest-confidence box."""
+    """Resolve duplicate, fragmented and overlapping panel detections.
+
+    The previous implementation simply dropped the lower-scoring box whenever
+    one box contained another.  That loses real panels in two common cases:
+
+    * A panel detected as a full box plus a contained higher-scoring fragment;
+      the fragment won and was then too small to survive the size filter.
+    * Two overlapping panels where one box contains most of the other.
+
+    Instead of dropping, boxes are unified:
+
+    * Near-identical boxes (IoU >= ``iou_threshold``) are merged into their
+      union.
+    * Deeply contained boxes are fragments of the same panel and are merged
+      into their union.  This catches detector fragments whose edges are not
+      aligned closely enough to pass a shared-edge test.
+    * Any other overlapping pair is kept: overlapping panels are a legitimate
+      manga layout.
+    """
     ordered = sorted(detections, key=lambda detection: detection.score, reverse=True)
     kept: list[Detection] = []
     removed = 0
 
     for candidate in ordered:
-        duplicate = any(
-            iou(candidate.box, existing.box) >= iou_threshold
-            or containment(candidate.box, existing.box) >= containment_threshold
-            or containment(existing.box, candidate.box) >= containment_threshold
-            for existing in kept
-        )
-        if duplicate:
+        merge_index: int | None = None
+
+        for index, existing in enumerate(kept):
+            if iou(candidate.box, existing.box) >= iou_threshold:
+                merge_index = index
+                break
+
+            overlap = max(
+                containment(candidate.box, existing.box),
+                containment(existing.box, candidate.box),
+            )
+            if overlap < containment_threshold:
+                continue
+
+            # At least 90% containment means the detector produced two views
+            # of the same frame.  This deliberately includes a full-page box
+            # with an entirely nested box: the union preserves the larger
+            # frame and exports only one crop.
+            merge_index = index
+            break
+
+        if merge_index is not None:
+            kept[merge_index] = _merged_detection(kept[merge_index], candidate)
             removed += 1
         else:
             kept.append(candidate)
@@ -166,18 +273,43 @@ def final_nested_cleanup(
     pairs: list[tuple[np.ndarray, Detection]],
     *,
     containment_threshold: float,
+    iou_threshold: float = 0.80,
+    page_area: int | None = None,
+    background_ratio: float = DEFAULT_BACKGROUND_RATIO,
 ) -> tuple[list[tuple[np.ndarray, Detection]], int]:
-    """Remove final crops that are almost completely contained by another crop."""
+    """Merge duplicate or deeply nested crops.
+
+    Near-identical or deeply contained boxes are a single panel and are
+    replaced with their union, including page-spanning boxes.
+    """
     ordered = sorted(pairs, key=lambda pair: pair[1].score, reverse=True)
     kept: list[tuple[np.ndarray, Detection]] = []
     removed = 0
 
     for candidate_box, candidate_source in ordered:
-        if any(
-            containment(candidate_box, kept_box) >= containment_threshold
-            or containment(kept_box, candidate_box) >= containment_threshold
-            for kept_box, _ in kept
-        ):
+        merge_index: int | None = None
+
+        for index, (kept_box, _) in enumerate(kept):
+            if iou(candidate_box, kept_box) >= iou_threshold:
+                merge_index = index
+                break
+
+            overlap = max(
+                containment(candidate_box, kept_box),
+                containment(kept_box, candidate_box),
+            )
+            if overlap >= containment_threshold:
+                merge_index = index
+                break
+
+        if merge_index is not None:
+            kept_box, kept_source = kept[merge_index]
+            source = (
+                candidate_source
+                if candidate_source.score > kept_source.score
+                else kept_source
+            )
+            kept[merge_index] = (union_box(kept_box, candidate_box), source)
             removed += 1
         else:
             kept.append((candidate_box, candidate_source))

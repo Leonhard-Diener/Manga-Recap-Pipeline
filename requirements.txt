@@ -1,6 +1,7 @@
 numpy
 Pillow
 onnxruntime
+scikit-learn
 huggingface_hub
 requests
 httpx

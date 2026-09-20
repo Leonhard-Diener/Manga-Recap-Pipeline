@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 from PIL import Image
+from common.utils import natural_sort_key
 
 from .detector import IMAGE_SUFFIXES, load_session, page_tiles, predict
 from .export import build_result, save_panel_crop
@@ -36,10 +37,12 @@ from .postprocess import (
     final_nested_cleanup,
     protect_content,
 )
+from .splitter import SplitSettings, split_merged_panels
 from .types import Detection, PageDetection, PanelDetection
 
 
 # ── detect_panels ─────────────────────────────────────────────────────────────
+
 
 def detect_panels(
     input_dir: Path,
@@ -57,6 +60,8 @@ def detect_panels(
     minimum_panel_ratio: float,
     duplicate_iou: float,
     duplicate_containment: float,
+    background_panel_ratio: float = 0.90,
+    edge_align_tolerance: float = 0.02,
     # ── Post-processing step toggles ──────────────────────────────────────────
     enable_deduplication: bool = True,
     enable_small_panel_filter: bool = True,
@@ -72,12 +77,21 @@ def detect_panels(
     max_content_expansion_ratio: float,
     jpeg_quality: int,
     save_debug: bool,
+    body_detections: dict[Path, list[Detection]] | None = None,
+    split_settings: SplitSettings | None = None,
 ) -> list[PageDetection]:
     """Run detection and post-processing on every page in *input_dir*.
 
     Saves annotated preview images (numbered borders) to
     ``output_dir/page_previews/`` and optional debug overlays to
     ``output_dir/``.  No panel crops are written.
+
+    If ``body_detections`` is provided, the body/character detections produced
+    by the same RT-DETR inference pass are copied into that dictionary.
+    No additional detector inference is performed.
+
+    If ``split_settings`` is provided, frame boxes that actually contain more
+    than one panel are split back apart before the post-processing steps run.
 
     Returns
     -------
@@ -90,9 +104,12 @@ def detect_panels(
     output_dir.mkdir(parents=True, exist_ok=True)
     session = load_session(model_path)
 
-    pages = sorted(
-        path for path in input_dir.iterdir() if path.suffix.lower() in IMAGE_SUFFIXES
-    )
+    pages = sorted((
+        path
+        for path in input_dir.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_SUFFIXES
+    ), key=natural_sort_key)
+
     if not pages:
         raise FileNotFoundError(f"No image pages found in {input_dir}")
 
@@ -103,6 +120,7 @@ def detect_panels(
         width, height = image.size
         page_area = width * height
 
+        # One detector inference pass.
         raw_panels, texts, bodies = predict(
             session,
             image,
@@ -112,10 +130,33 @@ def detect_panels(
             body_confidence=body_confidence,
         )
 
-        coverage_before = estimate_coverage(raw_panels, width, height)
+        # Split boxes that the detector merged around two touching panels.
+        if split_settings is not None:
+            raw_panels, split_added = split_merged_panels(
+                image,
+                raw_panels,
+                session=session,
+                image_size=image_size,
+                panel_confidence=panel_confidence,
+                text_confidence=text_confidence,
+                body_confidence=body_confidence,
+                settings=split_settings,
+            )
+        else:
+            split_added = 0
+
+        coverage_before = estimate_coverage(
+            raw_panels,
+            width,
+            height,
+        )
+
         fallback_added = 0
 
-        if enable_tiled_fallback and (1.0 - coverage_before) >= fallback_uncovered_ratio:
+        if (
+            enable_tiled_fallback
+            and (1.0 - coverage_before) >= fallback_uncovered_ratio
+        ):
             recovered_panels, recovered_texts, recovered_bodies = page_tiles(
                 image,
                 session,
@@ -126,29 +167,58 @@ def detect_panels(
                 grid=fallback_grid,
                 overlap=fallback_overlap,
             )
+
             before = len(raw_panels)
+
             raw_panels.extend(recovered_panels)
             texts.extend(recovered_texts)
             bodies.extend(recovered_bodies)
+
             if enable_deduplication:
                 raw_panels, _ = deduplicate(
                     raw_panels,
                     iou_threshold=duplicate_iou,
                     containment_threshold=duplicate_containment,
+                    page_area=page_area,
+                    background_ratio=background_panel_ratio,
+                    edge_tolerance=edge_align_tolerance,
                 )
-            fallback_added = max(0, len(raw_panels) - before)
+
+            fallback_added = max(
+                0,
+                len(raw_panels) - before,
+            )
+
+        # ── Optional body/character export ───────────────────────────────────
+        #
+        # This uses the body detections from the SAME inference pass.
+        # Nothing is written unless the caller supplied `body_detections`.
+        if body_detections is not None:
+            body_detections[page_path] = [
+                Detection(
+                    np.asarray(detection.box, dtype=np.float32).copy(),
+                    float(detection.score),
+                    int(detection.class_id),
+                )
+                for detection in bodies
+            ]
 
         # ── Step 1: Deduplication ─────────────────────────────────────────────
+
         if enable_deduplication:
             deduped, duplicate_removed = deduplicate(
                 raw_panels,
                 iou_threshold=duplicate_iou,
                 containment_threshold=duplicate_containment,
+                page_area=page_area,
+                background_ratio=background_panel_ratio,
+                edge_tolerance=edge_align_tolerance,
             )
         else:
             deduped, duplicate_removed = list(raw_panels), 0
 
         # ── Step 2: Small-panel filter ────────────────────────────────────────
+
         if enable_small_panel_filter:
             filtered, small_removed = filter_small_panels(
                 deduped,
@@ -159,7 +229,9 @@ def detect_panels(
             filtered, small_removed = list(deduped), 0
 
         # ── Step 3: Content protection ────────────────────────────────────────
+
         final_pairs: list[tuple[np.ndarray, Detection]] = []
+
         for panel in filtered:
             if enable_content_protection:
                 final_box = protect_content(
@@ -175,45 +247,93 @@ def detect_panels(
                 )
             else:
                 final_box = panel.box.copy()
-            final_pairs.append((final_box, panel))
+
+            final_pairs.append(
+                (final_box, panel)
+            )
 
         # ── Step 4: Nested-box cleanup ────────────────────────────────────────
+
         if enable_nested_cleanup:
             final_pairs, nested_removed = final_nested_cleanup(
                 final_pairs,
                 containment_threshold=duplicate_containment,
+                iou_threshold=duplicate_iou,
+                page_area=page_area,
+                background_ratio=background_panel_ratio,
             )
         else:
             nested_removed = 0
 
         coverage_after = estimate_coverage(
-            [Detection(np.asarray(box), 1.0, 2) for box, _ in final_pairs],
+            [
+                Detection(
+                    np.asarray(box),
+                    1.0,
+                    2,
+                )
+                for box, _ in final_pairs
+            ],
             width,
             height,
         )
 
+        # Debug image remains unchanged.
+        # Character/body boxes are only included when save_debug=True,
+        # exactly as in the original pipeline.
         if save_debug:
             debug = debug_image(
                 image,
                 raw_panels=raw_panels,
                 texts=texts,
                 bodies=bodies,
-                final_boxes=[box for box, _ in final_pairs],
+                final_boxes=[
+                    box
+                    for box, _ in final_pairs
+                ],
             )
-            debug.save(output_dir / f"debug_{page_path.stem}.jpg", quality=92)
+
+            debug.save(
+                output_dir / f"debug_{page_path.stem}.jpg",
+                quality=92,
+            )
+
+        # Keep undetected pages visible to the description/review stages.
+        provisional = not final_pairs
+        if provisional:
+            box = np.asarray([0, 0, width, height], dtype=np.float32)
+            final_pairs = [(box, Detection(box, 0.0, 2))]
 
         # Sort into manga reading order and save the annotated preview.
-        raw_boxes = [box for box, _ in final_pairs]
-        raw_scores = [float(src.score) for _, src in final_pairs]
-
-        ordered_indices = _manga_reading_order(raw_boxes)
-        ordered_boxes = [
-            [int(round(v)) for v in raw_boxes[i]] for i in ordered_indices
+        raw_boxes = [
+            box
+            for box, _ in final_pairs
         ]
-        ordered_scores = [raw_scores[i] for i in ordered_indices]
+
+        raw_scores = [
+            float(src.score)
+            for _, src in final_pairs
+        ]
+
+        ordered_indices = _manga_reading_order(
+            raw_boxes
+        )
+
+        ordered_boxes = [
+            [
+                int(round(v))
+                for v in raw_boxes[i]
+            ]
+            for i in ordered_indices
+        ]
+
+        ordered_scores = [
+            raw_scores[i]
+            for i in ordered_indices
+        ]
 
         if raw_boxes:
-            save_page_preview(
+            preview_path = save_page_preview(
                 image,
                 raw_boxes,
                 page_path,
@@ -226,6 +346,8 @@ def detect_panels(
                 page_path=page_path,
                 boxes=ordered_boxes,
                 scores=ordered_scores,
+                provisional=provisional,
+                preview_path=preview_path,
             )
         )
 
@@ -233,6 +355,7 @@ def detect_panels(
             f"{page_path.name}: "
             f"frames={len(raw_panels)} | "
             f"coverage={coverage_before:.1%}->{coverage_after:.1%} | "
+            f"split_added={split_added} | "
             f"fallback_added={fallback_added} | "
             f"duplicates_removed={duplicate_removed} | "
             f"small_removed={small_removed} | "
@@ -245,13 +368,14 @@ def detect_panels(
 
 # ── crop_panels ───────────────────────────────────────────────────────────────
 
+
 def crop_panels(
     detections: list[PageDetection],
     output_dir: Path,
     *,
     jpeg_quality: int,
 ) -> list[PanelDetection]:
-    """Crop and save one JPEG per panel from pre-computed detections.
+    """Crop and save one JPEG per panel.
 
     Parameters
     ----------
@@ -268,22 +392,38 @@ def crop_panels(
     One :class:`PanelDetection` per saved crop, in reading order across all
     pages.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     results: list[PanelDetection] = []
     next_index = 1
 
     for page_detection in detections:
-        image = Image.open(page_detection.page_path).convert("RGB")
+        image = Image.open(
+            page_detection.page_path
+        ).convert("RGB")
 
-        for box, score in zip(page_detection.boxes, page_detection.scores):
-            output_path = output_dir / f"panel_{next_index:04d}.jpg"
+        for box, score in zip(
+            page_detection.boxes,
+            page_detection.scores,
+        ):
+            output_path = (
+                output_dir
+                / f"panel_{next_index:04d}.jpg"
+            )
+
             integer_box = save_panel_crop(
                 image,
-                np.asarray(box, dtype=np.float32),
+                np.asarray(
+                    box,
+                    dtype=np.float32,
+                ),
                 output_path,
                 jpeg_quality=jpeg_quality,
             )
+
             results.append(
                 build_result(
                     next_index,
@@ -293,12 +433,14 @@ def crop_panels(
                     output_path,
                 )
             )
+
             next_index += 1
 
     return results
 
 
 # ── extract_panels (convenience wrapper) ──────────────────────────────────────
+
 
 def extract_panels(
     input_dir: Path,
@@ -316,6 +458,8 @@ def extract_panels(
     minimum_panel_ratio: float,
     duplicate_iou: float,
     duplicate_containment: float,
+    background_panel_ratio: float = 0.90,
+    edge_align_tolerance: float = 0.02,
     enable_deduplication: bool = True,
     enable_small_panel_filter: bool = True,
     enable_content_protection: bool = True,
@@ -329,12 +473,13 @@ def extract_panels(
     max_content_expansion_ratio: float,
     jpeg_quality: int,
     save_debug: bool,
+    split_settings: SplitSettings | None = None,
 ) -> list[PanelDetection]:
     """Detect panels then crop them in one call.
 
-    This is the entry point used by the production pipeline.  It calls
+    This is the entry point used by the production pipeline. It calls
     :func:`detect_panels` followed by :func:`crop_panels` without writing any
-    intermediate JSON.
+    intermediate JSON or capturing body detections.
     """
     detections = detect_panels(
         input_dir=input_dir,
@@ -351,6 +496,8 @@ def extract_panels(
         minimum_panel_ratio=minimum_panel_ratio,
         duplicate_iou=duplicate_iou,
         duplicate_containment=duplicate_containment,
+        background_panel_ratio=background_panel_ratio,
+        edge_align_tolerance=edge_align_tolerance,
         enable_deduplication=enable_deduplication,
         enable_small_panel_filter=enable_small_panel_filter,
         enable_content_protection=enable_content_protection,
@@ -364,7 +511,9 @@ def extract_panels(
         max_content_expansion_ratio=max_content_expansion_ratio,
         jpeg_quality=jpeg_quality,
         save_debug=save_debug,
+        split_settings=split_settings,
     )
+
     return crop_panels(
         detections,
         output_dir,

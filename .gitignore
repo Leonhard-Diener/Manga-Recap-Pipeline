@@ -11,3 +11,6 @@ input/*
 
 output/*
 !output/.gitkeep
+
+debug/*
+!debug/.gitkeep

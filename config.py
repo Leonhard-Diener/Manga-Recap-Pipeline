@@ -13,9 +13,10 @@ TEXT_CONFIDENCE = 0.20
 BODY_CONFIDENCE = 0.20
 
 # Recover panels when full-page inference leaves too much of the page
-# unexplained. Tiles are used only as page-level recovery, never recursively.
+# unexplained.  A 20% gap can already be one complete panel, so tiles are used
+# before a large missing frame is silently accepted.  They are never recursive.
 ENABLE_TILED_FALLBACK = True
-FALLBACK_UNCOVERED_RATIO = 0.35
+FALLBACK_UNCOVERED_RATIO = 0.20
 FALLBACK_GRID = (2, 2)
 FALLBACK_OVERLAP = 0.20
 
@@ -23,6 +24,16 @@ FALLBACK_OVERLAP = 0.20
 MINIMUM_PANEL_RATIO = 0.05
 DUPLICATE_IOU = 0.80
 DUPLICATE_CONTAINMENT = 0.90
+
+# Overlap resolution. Detectors sometimes return several partial boxes for a
+# single panel, or one panel drawn on top of another. Deeply nested boxes are
+# combined into one panel, including when the larger box spans the whole page.
+# EDGE_ALIGN_TOLERANCE is the coordinate tolerance (share of the larger box)
+# used to decide that two boxes share an edge and are fragments of one panel.
+# Retained for API compatibility and debug experimentation.  Containment is
+# resolved uniformly by the post-processor.
+BACKGROUND_PANEL_RATIO = 0.90
+EDGE_ALIGN_TOLERANCE = 0.02
 
 # ── Post-processing step toggles ──────────────────────────────────────────────
 # Set any flag to False to disable that specific post-processing step entirely.
@@ -40,6 +51,30 @@ ENABLE_CONTENT_PROTECTION = False
 
 # Final pass that drops crops almost completely contained by another crop.
 ENABLE_NESTED_CLEANUP = True
+
+# ── Merged-panel splitting ────────────────────────────────────────────────────
+# The frame detector sometimes returns one box around two panels that have no
+# visible gutter. These boxes are split using the drawn frame line between
+# them. Only when no frame line can be found (e.g. artwork breaking out of a
+# panel covers it) the detector is asked again on a zoomed crop as a fallback.
+ENABLE_FRAME_SPLIT = True
+ENABLE_AI_SPLIT_FALLBACK = False
+
+# Frame-line evidence.
+SPLIT_DARK_THRESHOLD = 100        # grayscale below which a pixel counts as ink
+SPLIT_MIN_LINE_RATIO = 0.70       # fraction of the box a frame line must span
+SPLIT_MARGIN = 0.05               # ignored border fraction at each box edge
+SPLIT_MAX_LINE_THICKNESS = 8      # px; thicker dark bands are art, not a border
+SPLIT_EDGE_GAP_RATIO = 0.02       # separator must connect to both parent-frame edges
+SPLIT_MIN_AREA_RATIO = 0.04       # each split sub-panel >= this page-area share
+SPLIT_MAX_DEPTH = 3               # recursive splits per detected box
+
+# AI fallback (zoomed re-inference).
+SPLIT_AI_MIN_AREA_RATIO = 0.15    # only re-run the detector on boxes this big
+SPLIT_AI_MIN_LINE_RATIO = 0.30    # partial frame line that flags a possible merge
+SPLIT_AI_MIN_FRAMES = 2           # frames required to accept the AI split
+SPLIT_AI_TARGET_SIZE = 1024       # zoom the crop so its long side reaches this
+SPLIT_AI_MAX_UPSCALE = 3.0        # cap on the zoom factor
 
 # Content protection. These values only affect a panel when detected content
 # actually crosses the panel boundary.
@@ -71,6 +106,8 @@ def panel_extraction_kwargs() -> dict:
         minimum_panel_ratio=MINIMUM_PANEL_RATIO,
         duplicate_iou=DUPLICATE_IOU,
         duplicate_containment=DUPLICATE_CONTAINMENT,
+        background_panel_ratio=BACKGROUND_PANEL_RATIO,
+        edge_align_tolerance=EDGE_ALIGN_TOLERANCE,
         enable_deduplication=ENABLE_DEDUPLICATION,
         enable_small_panel_filter=ENABLE_SMALL_PANEL_FILTER,
         enable_content_protection=ENABLE_CONTENT_PROTECTION,
@@ -84,6 +121,30 @@ def panel_extraction_kwargs() -> dict:
         max_content_expansion_ratio=MAX_CONTENT_EXPANSION_RATIO,
         jpeg_quality=JPEG_QUALITY,
         save_debug=SAVE_DEBUG,
+        split_settings=split_settings(),
+    )
+
+
+def split_settings() -> "SplitSettings":
+    """Merged-panel splitter settings, ready to pass into ``detect_panels()``."""
+    # Imported lazily so importing config does not pull in onnxruntime.
+    from panel_extractor.splitter import SplitSettings
+
+    return SplitSettings(
+        enable_frame_split=ENABLE_FRAME_SPLIT,
+        enable_ai_fallback=ENABLE_AI_SPLIT_FALLBACK,
+        dark_threshold=SPLIT_DARK_THRESHOLD,
+        min_line_ratio=SPLIT_MIN_LINE_RATIO,
+        margin=SPLIT_MARGIN,
+        max_line_thickness=SPLIT_MAX_LINE_THICKNESS,
+        edge_gap_ratio=SPLIT_EDGE_GAP_RATIO,
+        min_area_ratio=SPLIT_MIN_AREA_RATIO,
+        max_depth=SPLIT_MAX_DEPTH,
+        ai_min_area_ratio=SPLIT_AI_MIN_AREA_RATIO,
+        ai_min_line_ratio=SPLIT_AI_MIN_LINE_RATIO,
+        ai_min_frames=SPLIT_AI_MIN_FRAMES,
+        ai_target_size=SPLIT_AI_TARGET_SIZE,
+        ai_max_upscale=SPLIT_AI_MAX_UPSCALE,
     )
 
 
@@ -112,5 +173,6 @@ CLEANUP_MAX_NEW_TOKENS = 4
 # Step 4: per-panel page description.
 DESCRIPTION_MIN_PIXELS = 256 * 28 * 28
 DESCRIPTION_MAX_PIXELS = 384 * 28 * 28
-DESCRIPTION_MAX_NEW_TOKENS = 48
+# Shared budget for all panel descriptions plus character-event JSON per page.
+DESCRIPTION_MAX_NEW_TOKENS = 1024
 DESCRIPTION_ENABLE_THINKING = False

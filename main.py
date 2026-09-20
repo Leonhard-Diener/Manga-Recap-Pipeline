@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 
 import config
 from cleanup.classifier import clean_manga
@@ -100,7 +101,15 @@ def main() -> None:
     print("=" * 60)
     manga_output_dir = config.OUTPUT_DIR / manga_dir.name
     output_file = config.OUTPUT_DIR / f"{manga_dir.name}_descriptions.json"
-    describe_manga(manga_output_dir, chapter_dirs, output_file)
+    description_result = describe_manga(manga_output_dir, chapter_dirs)
+    # Preserve this runner's existing description export. Character events are
+    # available in description_result["transformations"] for later stages.
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+    output_file.write_text(
+        json.dumps(description_result["descriptions"], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    print(f"\nSaved descriptions to {output_file}")
 
     print("\nPipeline complete.")
 
