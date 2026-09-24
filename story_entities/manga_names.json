@@ -1,0 +1,33 @@
+{
+  "schema_version": 2,
+  "kind": "common_japanese_surnames",
+  "source": "https://github.com/shuheilocale/japanese-personal-name-dataset",
+  "license": "MIT",
+  "names": [
+    "Satou", "Suzuki", "Takahashi", "Tanaka", "Itou", "Watanabe", "Yamamoto", "Nakamura",
+    "Kobayashi", "Katou", "Yoshida", "Yamada", "Sasaki", "Yamaguchi", "Matsumoto", "Inoue",
+    "Kimura", "Hayashi", "Saitou", "Shimizu", "Yamazaki", "Mori", "Ikeda", "Hashimoto",
+    "Abe", "Ishikawa", "Yamashita", "Nakajima", "Ishii", "Ogawa", "Maeda", "Okada",
+    "Hasegawa", "Fujita", "Gotou", "Kondou", "Murakami", "Endou", "Aoki", "Sakamoto",
+    "Fukuda", "Oota", "Nishimura", "Fujii", "Okamoto", "Fujiwara", "Kaneko", "Miura",
+    "Nakano", "Nakagawa", "Harada", "Matsuda", "Takeuchi", "Ono", "Tamura", "Nakayama",
+    "Wada", "Ishida", "Morita", "Ueda", "Hara", "Uchida", "Shibata", "Sakai",
+    "Miyazaki", "Yokoyama", "Takagi", "Andou", "Miyamoto", "Oono", "Kojima", "Kudou",
+    "Taniguchi", "Imai", "Takada", "Masuda", "Maruyama", "Sugiyama", "Murata", "Ootsuka",
+    "Arai", "Fujimoto", "Koyama", "Hirano", "Kouno", "Ueno", "Takeda", "Noguchi",
+    "Matsui", "Chiba", "Sugawara", "Iwasaki", "Kubo", "Kinoshita", "Sano", "Nomura",
+    "Matsuo", "Kikuchi", "Sugimoto", "Ichikawa", "Furukawa", "Oonishi", "Shimada", "Mizuno",
+    "Sakurai", "Watabe", "Takano", "Yoshikawa", "Yamauchi", "Nishida", "Iida", "Komatsu",
+    "Nishikawa", "Kitamura", "Yasuda", "Igarashi", "Kawaguchi", "Hirata", "Seki", "Nakada",
+    "Kubota", "Higashi", "Hattori", "Iwata", "Kawasaki", "Tsuchiya", "Fukushima", "Honda",
+    "Higuchi", "Tsuji", "Akiyama", "Taguchi", "Nagai", "Yamanaka", "Nakanishi", "Yoshimura",
+    "Kawakami", "Matsuoka", "Hamada", "Oohashi", "Ishihara", "Baba", "Morimoto", "Yano",
+    "Matsushita", "Asano", "Hoshino", "Yoshioka", "Ookubo", "Koike", "Noda", "Araki",
+    "Matsuura", "Kumagai", "Ootani", "Naitou", "Kuroda", "Ozaki", "Mochizuki", "Kawamura",
+    "Nagata", "Matsumura", "Hori", "Tanabe", "Sugano", "Ooshima", "Hirai", "Nishiyama",
+    "Hayakawa", "Kurihara", "Hirose", "Yokota", "Ishibashi", "Iwamoto", "Hagiwara", "Katayama",
+    "Sekiguchi", "Miyata", "Ooishi", "Honma", "Takayama", "Sudou", "Yoshino", "Okazaki",
+    "Oda", "Kamata", "Uehara", "Shinohara", "Konishi", "Matsubara", "Fukui", "Koga",
+    "Oomori", "Narita", "Koizumi", "Minami", "Okumura", "Uchiyama", "Miyake", "Kuwabara"
+  ]
+}

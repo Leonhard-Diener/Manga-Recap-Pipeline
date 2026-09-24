@@ -262,11 +262,17 @@ def main(argv=None) -> dict:
     if args.group_distance is not None:
         encoder.default_threshold = args.group_distance
     calibration = load_calibration(args.calibration, encoder)
-    event_data = read_json(config.OUTPUT_DIR / f"{manga_dir.name}_transformations.json")
+    analysis_data = read_json(config.OUTPUT_DIR / f"{manga_dir.name}_descriptions.json", {})
+    event_data = analysis_data.get("transformations") if isinstance(analysis_data, dict) else None
+    # Old split artifacts remain readable, but normal description runs now
+    # create only the combined file above.
+    if event_data is None:
+        event_data = read_json(config.OUTPUT_DIR / f"{manga_dir.name}_transformations.json")
     result, crops, _ = classify_manga(
         manga_dir, chapters, source_output, encoder=encoder,
         cache_dir=source_output / "reid_cache", reviews=reviews,
-        calibration=calibration, transformations=event_data, style_encoder=style_encoder,
+        calibration=calibration, transformations=event_data,
+        style_encoder=style_encoder,
     )
     publish_result(result, crops, destination, chapters, reviews=reviews, calibration=calibration,
                    gallery=not args.no_gallery, source_output=source_output)

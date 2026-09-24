@@ -173,6 +173,9 @@ CLEANUP_MAX_NEW_TOKENS = 4
 # Step 4: per-panel page description.
 DESCRIPTION_MIN_PIXELS = 256 * 28 * 28
 DESCRIPTION_MAX_PIXELS = 384 * 28 * 28
-# Shared budget for all panel descriptions plus character-event JSON per page.
+# Generous ceiling: generation normally stops at EOS. Throughput comes from
+# processing two pages together, not from truncating or regenerating answers.
 DESCRIPTION_MAX_NEW_TOKENS = 1024
+DESCRIPTION_BATCH_SIZE = 2
+DESCRIPTION_MAX_DESCRIPTION_CHARS = 100
 DESCRIPTION_ENABLE_THINKING = False

@@ -50,16 +50,15 @@ The title argument is optional if `config.MANGA_TITLE` is set, or if
 output/<manga title>/<chapter>/
     panel_0001.jpg ...            # step 3 crops
     page_previews/<page>.jpg      # step 3 numbered previews
-output/<manga title>_descriptions.json   # step 4
-output/<manga title>_transformations.json # test_description.py only
+output/<manga title>_descriptions.json   # descriptions + transformations
 ```
 
-`test_description.py` writes both files from the same Qwen page-generation pass.
-The second file contains proposed transformations, reversions, disguise reveals,
+`test_description.py` writes one combined file from the Qwen page-generation pass.
+Its `transformations` section contains proposed transformations, reversions, disguise reveals,
 possession, summoning, splitting, and fusion events, grouped by chapter and page.
 Events include source/target panel numbers, visual descriptions, and evidence;
 they are always marked `pending_review` and never assign character identities.
-This first implementation sees one page at a time, so cross-page transitions
+Each result still interprets one page independently, so cross-page transitions
 are not inferred. Invalid or truncated responses are flagged separately from
 successful pages containing no events.
 New exports also retain source-image hashes and panel-geometry revisions, allowing
@@ -74,19 +73,23 @@ descriptions = result["descriptions"]
 transformations = result["transformations"]
 ```
 
-JSON serialization happens in the runners. `main.py` keeps its existing
-descriptions export and has the event data available in memory for later stages.
-The combined response has a 1024-token maximum per page (configurable in
-`config.py`); longer outputs can increase generation time. Thinking remains off.
+JSON serialization happens in the runners. The model emits a compact internal
+schema that is expanded before export. Token-level schema enforcement guarantees
+the required description and event lists instead of relying on prompt
+compliance. Its tokenizer grammar is cached beside the local Qwen model after the
+first build. Description inference batches compatible pairs of pages into one GPU
+generation call, while each page keeps a 1024-token ceiling and is never regenerated
+because of a smaller first-pass budget. Thinking remains off.
 
 ## Character identity experiment
 
 Run `python -X utf8 test_character_reid.py "Manga title"` after `test_panels.py`.
 It uses cached DINOv3 features, matches across all chapters, and exports tentative
 visual groups separately from accepted identities. No Qwen model is loaded.
-Unknown is preferred over a wrong name; automatic propagation requires reviewed
-references and calibrated thresholds. See [CHARACTER_REID_USAGE.md](CHARACTER_REID_USAGE.md)
-for review files, transformations, naming rules, current limitations, and the
+Canonical identities remain conservative. Retained visual groups automatically receive
+a stable pseudorandom display name from a bundled pool of 200 common Japanese surnames;
+ungrouped observations remain unnamed. See [CHARACTER_REID_USAGE.md](CHARACTER_REID_USAGE.md)
+for review files, transformations, display-name behavior, current limitations, and the
 reusable Python return API.
 The standalone runner also saves a manga-scoped SQLite revision history and
 source-linked review galleries. This workflow does not require running `main.py`.

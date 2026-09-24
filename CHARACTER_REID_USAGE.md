@@ -1,9 +1,10 @@
 # Character identity runner
 
 `test_character_reid.py` now performs manga-wide, precision-first visual matching.
-It does not load Qwen, invent names, or automatically equate a creature with a
-human because a description suggests a transformation. The reusable Python
-implementation is in `story_entities/`; JSON export belongs to the runner.
+It does not load Qwen or automatically equate a creature with a human because a
+description suggests a transformation. It gives each retained visual group a
+stable fallback display name. The reusable Python implementation is in
+`story_entities/`; JSON export belongs to the runner.
 
 ## 1. Prepare and run
 
@@ -188,6 +189,13 @@ creature-heavy material without testing it.
 
 ## 5. Names, minor characters, and recap safety
 
+Automatic OCR-derived naming is disabled. Each retained visual group receives a
+deterministic pseudorandom display name from `story_entities/manga_names.json`.
+The pool contains 200 common Japanese surnames, which are gender-neutral and
+natural character references in manga. Ungrouped observations receive no display
+name. These additive `display_name` fields do not replace reviewed canonical
+entity names.
+
 Count distinct accepted story-panel appearances across all chapters and forms.
 Multiple crops in one panel count once. At 1-3 panels, no name is released. At
 4+, a reviewed source-grounded name becomes eligible; recurrence does not prove
@@ -217,7 +225,7 @@ justify guessing gender; use a grounded descriptor, pronoun, or generic wording.
 
 ## 6. Transformation proposals from descriptions
 
-If `output/<manga>_transformations.json` exists, its successfully extracted events
+If the combined description JSON contains `transformations`, its successfully extracted events
 are attached as `transformation_proposals`, with possible source/target crop IDs
 based on panel numbers. They always remain `pending_review`, regardless of model
 confidence. Every crop in that panel is only a candidate, not a resolved actor.
@@ -228,9 +236,9 @@ form bridge. New events include source-image hashes and panel-geometry revisions
 Only exact matches receive candidate instance IDs. Stale or legacy unverified
 events remain visible with empty candidates; they never remap to changed pages.
 
-`test_description.py` already writes `output/<manga>_transformations.json` alongside
-the description JSON, using the same page-generation call. It checks expected
-panel coverage against the manifest and preserves raw responses for inspection.
+`test_description.py` writes transformations inside the same description JSON,
+using one page-generation call. It checks expected panel coverage against
+the manifest and preserves raw responses for inspection.
 
 ## 7. Creature detection and remaining limitations
 

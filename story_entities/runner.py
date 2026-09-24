@@ -44,7 +44,8 @@ def export_review_gallery(result: dict, crops: list[Image.Image], directory: Pat
     def card(record):
         identity = record["instance_id"]
         details = html.escape(str({k: record.get(k) for k in (
-            "chapter", "panel_number", "quality_flags", "entity_id", "form_id", "identity_status", "name")}))
+            "chapter", "panel_number", "quality_flags", "entity_id", "form_id", "identity_status",
+            "name", "display_name", "display_name_source")}))
         source_link = source_links.get(record["page"])
         context = f'<a href="{html.escape(source_link, quote=True)}">Original page</a>' if source_link else ''
         return (f'<article id="{identity}"><img loading="lazy" src="{identity}.jpg"><br><code>{identity}</code>'
@@ -72,7 +73,9 @@ def export_review_gallery(result: dict, crops: list[Image.Image], directory: Pat
     for group in sorted(groups, key=lambda g: (-g["size"], g["group_id"])):
         link_note = (f' — {len(group.get("style_links", []))} simple/detail subgroup link(s)'
                      if group.get("style_links") else '')
-        chunks.append("<section><h2>" + html.escape(group["group_id"]) +
+        display_name = group.get("display_name")
+        name_note = f' — {html.escape(display_name)}' if display_name else ''
+        chunks.append("<section><h2>" + html.escape(group["group_id"]) + name_note +
                       f' ({group["size"]} crops / {group.get("occurrence_count", group["size"])} panels)'
                       f'{link_note}</h2>')
         if group["size"] > 1:

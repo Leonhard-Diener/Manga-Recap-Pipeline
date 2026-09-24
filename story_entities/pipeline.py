@@ -12,6 +12,7 @@ from PIL import Image, ImageOps
 from common.utils import natural_sort_key, list_images
 from .matching import resolve, stable_id
 from .manifest import file_hash
+from .naming import assign_group_display_names
 
 
 def read_json(path: Path, default=None):
@@ -363,6 +364,7 @@ def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transfor
                      assignment_group_threshold=prepared.get("assignment_group_threshold", .14),
                      style_distances=prepared.get("style_distances"))
     result["warnings"] = warnings + result["warnings"]
+    assign_group_display_names(result, prepared["manga"])
     if calibration is None:
         result["warnings"].append("No validated calibration: visual groups are proposals. Only reviewed instances receive canonical identities.")
     events = []
@@ -407,7 +409,8 @@ def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transfor
                                    prepared["group_threshold"], reviews, calibration,
                                    prepared.get("assignment_group_threshold", .14),
                                    prepared.get("style_encoder_fingerprint"), result["style_links"],
-                                   events, [(x["instance_id"], x["panel_id"], x["quality_flags"],
+                                   events,
+                                   [(x["instance_id"], x["panel_id"], x["quality_flags"],
                                              x["page_role"], x["reading_position"]) for x in instances],
                                    result["characters"], result["identities"], result["visual_groups"])
     return result
@@ -428,5 +431,6 @@ def classify_manga(manga_dir: Path, chapters: list[Path], output_dir: Path, *, e
             encoder.close()
         if style_encoder is not None and hasattr(style_encoder, "close"):
             style_encoder.close()
-    result = resolve_prepared(prepared, reviews=reviews, calibration=calibration, transformations=transformations)
+    result = resolve_prepared(prepared, reviews=reviews, calibration=calibration,
+                              transformations=transformations)
     return result, prepared["crops"], prepared["distances"]
