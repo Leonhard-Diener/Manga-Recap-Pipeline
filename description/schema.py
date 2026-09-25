@@ -55,8 +55,9 @@ def page_response_schema(expected_panels=None) -> dict:
             "td": {"type": "string", "minLength": 1, "maxLength": 80},
             "x": {"type": "string", "minLength": 1, "maxLength": 160},
             "xt": {"enum": ["visible_change", "explicit_text", "ambiguous_sequence"]},
+            "c": {"type": "integer", "minimum": 0, "maximum": 100},
         },
-        "required": ["t", "sp", "tp", "sd", "td", "x", "xt"],
+        "required": ["t", "sp", "tp", "sd", "td", "x", "xt", "c"],
         "additionalProperties": False,
     }
     return {

@@ -57,7 +57,9 @@ output/<manga title>_descriptions.json   # descriptions + transformations
 Its `transformations` section contains proposed transformations, reversions, disguise reveals,
 possession, summoning, splitting, and fusion events, grouped by chapter and page.
 Events include source/target panel numbers, visual descriptions, and evidence;
-they are always marked `pending_review` and never assign character identities.
+they begin as `pending_review`. During ReID, only 100%-certain direct visible
+changes with unique, current, high-quality adjacent-panel endpoints can connect
+separate forms under one entity. All other events remain pending.
 Each result still interprets one page independently, so cross-page transitions
 are not inferred. Invalid or truncated responses are flagged separately from
 successful pages containing no events.

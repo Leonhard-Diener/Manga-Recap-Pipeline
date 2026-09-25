@@ -12,7 +12,7 @@ import asyncio
 import sys
 
 import config
-from downloader.download_chapter import download_chapter
+from downloader.download_chapter import download_chapters
 from downloader.get_chapter_ids import get_chapter_ids
 from downloader.get_manga_id import get_manga_id
 
@@ -27,9 +27,7 @@ async def download_manga(title: str, all_chapters: bool) -> None:
         return
 
     chosen = chapter_ids if all_chapters else chapter_ids[:1]
-    for index, chapter_id in enumerate(chosen, start=1):
-        print(f"\nDownloading chapter {index}/{len(chosen)}")
-        await download_chapter(chapter_id, title, index)
+    await download_chapters(chosen, title)
 
     print("\nDownload complete.")
 

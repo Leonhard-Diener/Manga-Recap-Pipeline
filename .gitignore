@@ -16,3 +16,5 @@ debug/*
 !debug/.gitkeep
 
 /_vlm_probe_*.log
+
+backup/*

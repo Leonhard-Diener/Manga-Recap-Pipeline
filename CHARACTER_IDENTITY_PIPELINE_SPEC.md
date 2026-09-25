@@ -380,10 +380,13 @@ Likewise, two similar simultaneous figures can be separate clones. Require
 depicted distinct individuals or human confirmation before creating a hard
 separation constraint.
 
-For version 1, automatic cross-form transformation merges are disabled.
-Review can accept them; unattended runs keep the forms separate and use generic
-narration. This is deliberate given the cost of falsely naming a protagonist.
-A future automatic rule must first pass a held-out transformation benchmark.
+Automatic cross-form identity links are fail-closed. They are accepted only for
+a current, complete same-page event marked 100% certain by Qwen, with direct
+visible-change evidence in adjacent panels, exactly one high-quality detected
+instance at each endpoint, and no reviewed identity conflict. The visual groups
+remain separate forms under one entity. Every event that misses any gate remains
+pending. This strict rule still needs a held-out transformation benchmark; model
+self-confidence is not a mathematical guarantee of correctness.
 
 A summon, possession, fusion, or split never automatically means equality of
 identities. Preserve its event type and endpoints. Defer complex consciousness

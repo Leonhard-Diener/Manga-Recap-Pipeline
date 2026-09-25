@@ -1,5 +1,5 @@
-import requests
 import config
+from downloader.mangadex_api import get
 
 
 def get_chapter_ids(manga_id, language="en"):
@@ -9,7 +9,7 @@ def get_chapter_ids(manga_id, language="en"):
     limit = 100
 
     while True:
-        response = requests.get(
+        response = get(
             f"{config.BASE_URL}/{manga_id}/feed",
             params={
                 "translatedLanguage[]": language,

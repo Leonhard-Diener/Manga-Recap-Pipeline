@@ -144,12 +144,19 @@ def parse_page_response(response: str, *, truncated: bool = False, expected_pane
         if evidence_type not in ("visible_change", "explicit_text", "ambiguous_sequence"):
             result["errors"].append(f"Event {index + 1} has an unsupported evidence type.")
             continue
+        confidence = event.get("confidence_percent", event.get("c"))
+        if type(confidence) is not int or not 0 <= confidence <= 100:
+            result["errors"].append(
+                f"Event {index + 1} needs an integer confidence_percent from 0 to 100."
+            )
+            continue
         result["events"].append({
             "type": event_type,
             "source_panel": references[0],
             "target_panel": references[1],
             **{key: value.strip() for key, value in field_values.items()},
             "evidence_type": evidence_type,
+            "confidence_percent": confidence,
             "status": "pending_review",
         })
 

@@ -272,10 +272,33 @@ def validate_reviews(reviews: dict, instances: list[dict]) -> tuple[dict, set[fr
     return assignments, blocked, warnings
 
 
+def validate_automatic_assignments(assignments: dict | None, instances: list[dict]) -> dict:
+    """Validate internal, evidence-gated transformation assignments."""
+    if assignments is None:
+        return {}
+    if not isinstance(assignments, dict):
+        raise ValueError("Automatic assignments must be keyed by instance ID.")
+    known = {row["instance_id"] for row in instances}
+    validated = {}
+    for instance_id, entry in assignments.items():
+        if instance_id not in known or not isinstance(entry, dict):
+            raise ValueError("Automatic assignment references an unknown instance.")
+        if any(not isinstance(entry.get(key), str) or not entry[key].strip()
+               for key in ("entity_id", "form_id", "evidence")):
+            raise ValueError("Automatic assignment needs entity, form, and evidence.")
+        event_ids = entry.get("event_ids")
+        if (not isinstance(event_ids, list) or not event_ids
+                or any(not isinstance(value, str) or not value for value in event_ids)):
+            raise ValueError("Automatic assignment needs supporting event IDs.")
+        validated[instance_id] = dict(entry, event_ids=sorted(set(event_ids)))
+    return validated
+
+
 def resolve(instances: list[dict], distances: np.ndarray, *, reviews: dict | None = None,
             group_threshold: float = 0.20, calibration: dict | None = None,
             assignment_group_threshold: float = 0.14,
             style_distances: np.ndarray | None = None,
+            automatic_assignments: dict | None = None,
             minimum_group_frequency_ratio: float = .05) -> dict:
     """Return independent instance decisions; names never transfer from proposals.
 
@@ -285,6 +308,7 @@ def resolve(instances: list[dict], distances: np.ndarray, *, reviews: dict | Non
     """
     reviews = reviews or {}
     assignments, blocked, warnings = validate_reviews(reviews, instances)
+    automatic = validate_automatic_assignments(automatic_assignments, instances)
     core_groups = conservative_groups(instances, distances, group_threshold, blocked)
     groups, style_links = ((core_groups, []) if style_distances is None else
                            link_style_satellites(instances, core_groups, distances,
@@ -314,6 +338,7 @@ def resolve(instances: list[dict], distances: np.ndarray, *, reviews: dict | Non
     for i, instance in enumerate(instances):
         row = dict(instance)
         reviewed = assignments.get(instance["instance_id"])
+        transformed = automatic.get(instance["instance_id"])
         row.update(entity_id=None, form_id=None, name=None, identity_status="unknown",
                    visual_group_id=group_for[i], assignment_evidence=[], candidates=[],
                    naming_allowed=False, narration_allowed=False)
@@ -321,6 +346,17 @@ def resolve(instances: list[dict], distances: np.ndarray, *, reviews: dict | Non
             row.update(entity_id=reviewed["entity_id"], form_id=reviewed["form_id"],
                        identity_status="reviewed", assignment_evidence=[reviewed["evidence"]],
                        decision_ids=[stable_id("decision_", "assignments", reviewed)])
+        elif transformed and instance["prototype_eligible"]:
+            row.update(
+                entity_id=transformed["entity_id"],
+                form_id=transformed["form_id"],
+                identity_status="accepted_qwen_transformation",
+                assignment_evidence=[transformed["evidence"]],
+                decision_ids=[
+                    stable_id("decision_", "qwen_transformation", event_id)
+                    for event_id in transformed["event_ids"]
+                ],
+            )
         elif instance["prototype_eligible"]:
             ranked = []
             for (entity, form), refs in gallery.items():
@@ -369,7 +405,9 @@ def resolve(instances: list[dict], distances: np.ndarray, *, reviews: dict | Non
             if all(x["identity_status"] == "reviewed" for x in (a, b)):
                 continue
             for record in (a, b):
-                if record["identity_status"] == "accepted_visual":
+                if record["identity_status"] in (
+                    "accepted_visual", "accepted_qwen_transformation"
+                ):
                     record.update(entity_id=None, form_id=None, identity_status="unknown",
                                   assignment_evidence=[], decision_ids=[])
                     warnings.append(f"Rejected constraint conflict: {record['instance_id']}")

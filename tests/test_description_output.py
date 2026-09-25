@@ -22,6 +22,7 @@ from description.schema import page_response_schema
 
 def response_payload():
     return {
+        "page_role": "story",
         "panels": [
             {"panel_number": 1, "description": "A horned figure is covered in scales."},
             {"panel_number": 2, "description": "A dragon stands in the clearing."},
@@ -34,6 +35,7 @@ def response_payload():
             "target_description": "winged dragon",
             "evidence": "Scales and wings emerge from the figure.",
             "evidence_type": "visible_change",
+            "confidence_percent": 100,
         }],
     }
 
@@ -47,6 +49,7 @@ class ResponseTests(unittest.TestCase):
         self.assertEqual(schema["properties"]["p"]["maxItems"], 2)
         number = schema["properties"]["p"]["items"]["properties"]["n"]
         self.assertEqual(number["enum"], [1, 2])
+        self.assertIn("c", schema["properties"]["e"]["items"]["required"])
 
     def test_prompt_has_no_fictional_values_for_model_to_copy(self):
         self.assertNotIn("horned woman", PAGE_PROMPT.lower())
@@ -62,6 +65,7 @@ class ResponseTests(unittest.TestCase):
         result = parse_page_response(json.dumps(payload))
         self.assertEqual(result["status"], "complete")
         self.assertEqual(result["events"][0]["target_panel"], 2)
+        self.assertEqual(result["events"][0]["confidence_percent"], 100)
         self.assertEqual(result["events"][0]["status"], "pending_review")
         self.assertNotIn("identity", result["events"][0])
         self.assertNotIn("Scales and wings", result["panels"][0]["description"])
@@ -105,7 +109,7 @@ class ResponseTests(unittest.TestCase):
                   {"n": 2, "d": "A dragon stands nearby."}],
             "e": [{"t": "transformation", "sp": 1, "tp": 2,
                    "sd": "horned figure", "td": "dragon",
-                   "x": "wings visibly emerge", "xt": "visible_change"}],
+                   "x": "wings visibly emerge", "xt": "visible_change", "c": 100}],
         }
         result = parse_page_response(json.dumps(payload))
         self.assertEqual(result["status"], "complete")
@@ -118,6 +122,7 @@ class ResponseTests(unittest.TestCase):
             ("source_panel", 99), ("source_panel", True), ("target_panel", "2"),
             ("type", "same_character"), ("type", []), ("evidence", ""),
             ("source_description", None), ("evidence_type", "guess"),
+            ("confidence_percent", 101),
         ):
             with self.subTest(key=key, value=value):
                 payload = response_payload()
@@ -223,6 +228,42 @@ class ReturnAndExportTests(unittest.TestCase):
         failed = result["transformations"]["second.jpg"]
         self.assertEqual(failed["extraction_status"], "invalid_output")
         self.assertEqual(failed["raw_response"], "broken")
+        self.assertNotIn("page_filter", result)
+
+    def test_middle_non_story_page_is_filtered_without_losing_provenance(self):
+        story = parse_page_response(json.dumps(response_payload()))
+        story.update(generation_time=1.0, generated_tokens=100, raw_response="story")
+        extra_payload = response_payload()
+        extra_payload["page_role"] = "extra"
+        extra = parse_page_response(json.dumps(extra_payload))
+        extra.update(generation_time=1.0, generated_tokens=100, raw_response="extra")
+        pages = [Path("first.jpg"), Path("middle_cover.jpg"), Path("last.jpg")]
+
+        with patch("description.describer.list_images", return_value=pages), \
+                patch("description.describer.describe_pages",
+                      side_effect=[[story], [extra, story]]):
+            result = describe_chapter(Path("chapter_001"), object(), object())
+
+        self.assertEqual(set(result["descriptions"]), set(page.name for page in pages))
+
+        with patch("description.describer.list_images", return_value=pages), \
+                patch("description.describer.describe_pages",
+                      side_effect=[[story], [extra, story]]):
+            result = describe_chapter(
+                Path("chapter_001"),
+                object(),
+                object(),
+                filter_non_story=True,
+            )
+
+        self.assertEqual(set(result["descriptions"]), {"first.jpg", "last.jpg"})
+        self.assertNotIn("middle_cover.jpg", result["descriptions"])
+        middle_event = result["transformations"]["middle_cover.jpg"]
+        self.assertEqual(middle_event["page_role"], "extra")
+        self.assertEqual(middle_event["events"], [])
+        middle_filter = result["page_filter"]["middle_cover.jpg"]
+        self.assertFalse(middle_filter["included_in_story"])
+        self.assertEqual(middle_filter["reason"], "page_role_extra")
 
     def test_batch_oom_switches_remaining_chapter_to_single_pages(self):
         page = parse_page_response(json.dumps(response_payload()))
@@ -269,12 +310,20 @@ class ReturnAndExportTests(unittest.TestCase):
             self.assertEqual(list(output.iterdir()), [])
             self.assertEqual(set(result["descriptions"]), {"chapter_001", "chapter_002"})
             self.assertEqual(set(result["transformations"]["chapters"]), {"chapter_001", "chapter_002"})
+            self.assertNotIn("page_filter", result)
             self.assertNotIn("names", result)
 
     def test_test_runner_owns_combined_json_export_and_returns_data(self):
         expected = {
             "descriptions": {"chapter_001": {"00001.jpg": {"panels": []}}},
             "transformations": {"schema_version": 1, "scope": "within_page", "chapters": {}},
+            "page_filter": {
+                "schema_version": 1,
+                "policy": "story_only_v1",
+                "chapters": {"chapter_001": {
+                    "00001.jpg": {"included_in_story": True},
+                }},
+            },
         }
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "output"
@@ -284,7 +333,11 @@ class ReturnAndExportTests(unittest.TestCase):
                     patch.object(runner, "describe_manga", return_value=expected) as describe, \
                     patch.object(runner.sys, "argv", ["test_description.py", "Manga"]):
                 result = runner.main()
-            describe.assert_called_once_with(output / "Manga", [Path("chapter_001")])
+            describe.assert_called_once_with(
+                output / "Manga",
+                [Path("chapter_001")],
+                filter_non_story=True,
+            )
             self.assertIs(result, expected)
             self.assertEqual(set(path.name for path in output.iterdir()), {"Manga_descriptions.json"})
             actual = json.loads((output / "Manga_descriptions.json").read_text(encoding="utf-8"))

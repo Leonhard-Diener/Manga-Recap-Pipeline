@@ -1,4 +1,4 @@
-"""Step 4: describe what happens on each page, panel by panel.
+"""Describe and filter manga pages, panel by panel.
 
 One numbered page preview is analyzed in a single inference, returning panel
 descriptions and proposed character events. This module returns data; callers
@@ -38,9 +38,17 @@ writing d; never transcribe or quote them there. Event descriptions
 must be at most 8 words and event evidence at most 12 words. Never omit any
 required JSON key, even when its list is empty.
 
-page_role must be story, reference (profiles or character sheets), extra (credits,
-covers, advertisements or decorative artwork), or uncertain. Retain and describe
-all numbered regions even on non-story pages. Do not treat a cover as a story event.
+Classify page_role independently for every page, regardless of its position in
+the chapter:
+- story: sequential manga content where action, dialogue, or narration advances
+  a scene; a title overlay does not make an otherwise narrative scene non-story
+- reference: character profiles, stat sheets, cast guides, or other informational pages
+- extra: front/back covers, chapter-cover or title-only illustrations, standalone
+  color art, credits, scanlation messages, advertisements, or decorative artwork
+- uncertain: there is not enough visible evidence to decide safely
+
+Retain and describe all numbered regions even on non-story pages so the program
+can audit the decision. Do not treat a cover or illustration as a story event.
 
 Describe EVERY numbered panel briefly, including humans, humanoids, creatures,
 animals, dragons, demons, and other visible beings. Never filter for humans only.
@@ -52,11 +60,15 @@ character changing form; they do not prove two beings are the same character.
 
 For each event in e use exactly these short keys: t (type), sp (source panel),
 tp (target panel), sd (brief source appearance), td (brief target appearance),
-x (evidence), and xt (evidence type).
+x (evidence), xt (evidence type), and c (certainty from 0 to 100).
 
 evidence_type must be visible_change, explicit_text, or ambiguous_sequence.
 For explicit_text quote the short readable text. For ambiguous_sequence explain
 the uncertainty (for example, the creature could be a separate arrival).
+Use c:100 only when the same individual is directly and continuously shown
+changing appearance, with no scene cut, obscuring transition, possible arrival,
+or other plausible explanation. Otherwise use a lower value. Explicit text or
+similar appearances alone are never c:100.
 Both panel references must occur in panels. They may be the same panel if the
 change happens within one panel. Do not invent off-page endpoints.
 Return e: [] if no event is supported. Do not fabricate an event to fill
@@ -269,7 +281,13 @@ def describe_page(
     return describe_pages([(page_path, expected_panels)], processor, model)[0]
 
 
-def describe_chapter(chapter_output_dir: Path, processor, model) -> dict[str, dict]:
+def describe_chapter(
+    chapter_output_dir: Path,
+    processor,
+    model,
+    *,
+    filter_non_story: bool = False,
+) -> dict[str, dict]:
     """Describe every numbered page preview of one chapter (step 3's output)."""
     preview_dir = chapter_output_dir / "page_previews"
     pages = list_images(preview_dir)
@@ -286,6 +304,7 @@ def describe_chapter(chapter_output_dir: Path, processor, model) -> dict[str, di
 
     results: dict[str, dict] = {}
     transformations: dict[str, dict] = {}
+    page_filter: dict[str, dict] = {}
     jobs = []
     for page_path in pages:
         source = metadata.get(page_path.name, {})
@@ -333,6 +352,8 @@ def describe_chapter(chapter_output_dir: Path, processor, model) -> dict[str, di
             continue
 
         for (page_path, source, _), page in zip(batch, batch_results):
+            page_role = page.get("page_role", "uncertain")
+            included = page["status"] == "complete" and page_role == "story"
             print(f"    {page_path.name}: {page['generation_time']:.2f}s/image", flush=True)
             print(
                 f"    Tokens:   {page['generated_tokens']}/{page.get('token_limit', config.DESCRIPTION_MAX_NEW_TOKENS)}",
@@ -349,35 +370,62 @@ def describe_chapter(chapter_output_dir: Path, processor, model) -> dict[str, di
 
             if page["status"] != "complete":
                 print(f"    Warning: {page['errors']}", flush=True)
+            if filter_non_story and not included:
+                print(f"    Filter:   excluded ({page_role})", flush=True)
 
-            results[page_path.name] = {
-                "page_role": page.get("page_role", "uncertain"),
-                "source_hash": source.get("source_hash"),
-                "geometry_revision": source.get("geometry_revision"),
-                "panels": page["panels"],
-                "generation_time": page["generation_time"],
-                "generated_tokens": page["generated_tokens"],
-                "extraction_status": page["status"],
-            }
+            if included or not filter_non_story:
+                results[page_path.name] = {
+                    "page_role": page_role,
+                    "source_hash": source.get("source_hash"),
+                    "geometry_revision": source.get("geometry_revision"),
+                    "panels": page["panels"],
+                    "generation_time": page["generation_time"],
+                    "generated_tokens": page["generated_tokens"],
+                    "extraction_status": page["status"],
+                }
             transformations[page_path.name] = {
-                "page_role": page.get("page_role", "uncertain"),
+                "page_role": page_role,
                 "source_hash": source.get("source_hash"),
                 "geometry_revision": source.get("geometry_revision"),
                 "page_id": source.get("page_id"),
-                "events": page["events"],
+                "events": page["events"] if included or not filter_non_story else [],
                 "extraction_status": page["status"],
                 "errors": page["errors"],
             }
             transformations[page_path.name]["raw_response"] = page["raw_response"]
+            if filter_non_story:
+                page_filter[page_path.name] = {
+                    "page_role": page_role,
+                    "included_in_story": included,
+                    "reason": (
+                        "included_story"
+                        if included else
+                        f"extraction_{page['status']}"
+                        if page["status"] != "complete" else
+                        f"page_role_{page_role}"
+                    ),
+                    "source_hash": source.get("source_hash"),
+                    "geometry_revision": source.get("geometry_revision"),
+                    "page_id": source.get("page_id"),
+                    "extraction_status": page["status"],
+                }
 
         batch_start += len(batch)
 
-    return {"descriptions": results, "transformations": transformations}
+    result = {
+        "descriptions": results,
+        "transformations": transformations,
+    }
+    if filter_non_story:
+        result["page_filter"] = page_filter
+    return result
 
 
 def describe_manga(
     manga_output_dir: Path,
     chapter_dirs: list[Path],
+    *,
+    filter_non_story: bool = False,
 ) -> dict:
     """Return all manga-wide results without writing JSON or other artifacts."""
     import torch
@@ -393,14 +441,22 @@ def describe_manga(
 
     all_results: dict[str, dict] = {}
     transformations: dict[str, dict] = {}
+    page_filter: dict[str, dict] = {}
     for chapter_dir in chapter_dirs:
         chapter_output_dir = manga_output_dir / chapter_dir.name
         print(f"Chapter: {chapter_dir.name}")
-        chapter = describe_chapter(chapter_output_dir, processor, model)
+        chapter = describe_chapter(
+            chapter_output_dir,
+            processor,
+            model,
+            filter_non_story=filter_non_story,
+        )
         all_results[chapter_dir.name] = chapter["descriptions"]
         transformations[chapter_dir.name] = chapter["transformations"]
+        if filter_non_story:
+            page_filter[chapter_dir.name] = chapter["page_filter"]
 
-    return {
+    result = {
         "descriptions": all_results,
         "transformations": {
             "schema_version": 1,
@@ -408,3 +464,10 @@ def describe_manga(
             "chapters": transformations,
         },
     }
+    if filter_non_story:
+        result["page_filter"] = {
+            "schema_version": 1,
+            "policy": "story_only_v1",
+            "chapters": page_filter,
+        }
+    return result

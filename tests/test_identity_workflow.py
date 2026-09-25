@@ -271,6 +271,108 @@ class IdentitySafetyTests(unittest.TestCase):
             self.assertEqual(proposal["status"], "pending_review")
             self.assertEqual(result["identities"], [])
 
+    def test_certain_visible_transformation_connects_forms_and_display_name(self):
+        p, _ = fixture(4)
+        p["distances"] = np.array([
+            [0, .8, .04, .8],
+            [.8, 0, .8, .04],
+            [.04, .8, 0, .8],
+            [.8, .04, .8, 0],
+        ])
+        events = {"schema_version": 1, "chapters": {"chapter_001": {"page.png": {
+            "source_hash": "hash", "geometry_revision": "geometry",
+            "page_role": "story", "extraction_status": "complete",
+            "events": [{
+                "type": "transformation", "source_panel": 1, "target_panel": 2,
+                "source_description": "a horned figure",
+                "target_description": "a winged dragon",
+                "evidence": "The same body visibly grows wings.",
+                "evidence_type": "visible_change", "confidence_percent": 100,
+                "status": "pending_review",
+            }],
+        }}}}
+
+        result = resolve_prepared(p, transformations=events)
+
+        proposal = result["transformation_proposals"][0]
+        self.assertEqual(proposal["status"], "accepted_automatic")
+        self.assertEqual(proposal["acceptance_policy"], "qwen_direct_visible_change_v1")
+        transformed = result["characters"][:2]
+        self.assertEqual(transformed[0]["entity_id"], transformed[1]["entity_id"])
+        self.assertTrue(transformed[0]["entity_id"].startswith("entity_qwen_"))
+        self.assertTrue(all(row["identity_status"] == "accepted_qwen_transformation"
+                            for row in transformed))
+        self.assertEqual(len(result["visual_groups"]), 2)
+        self.assertEqual(
+            result["visual_groups"][0]["display_name"],
+            result["visual_groups"][1]["display_name"],
+        )
+
+    def test_automatic_transformation_fails_closed(self):
+        base_event = {
+            "type": "transformation", "source_panel": 1, "target_panel": 2,
+            "source_description": "a horned figure",
+            "target_description": "a winged dragon",
+            "evidence": "The same body visibly grows wings.",
+            "evidence_type": "visible_change", "confidence_percent": 100,
+        }
+        variants = [
+            ("confidence_percent", 99, "model_certainty_below_100"),
+            ("evidence_type", "explicit_text", "direct_visible_change_required"),
+            ("target_panel", 3, "adjacent_endpoint_panels_required"),
+            ("type", "summoning", "event_type_does_not_prove_same_identity"),
+        ]
+        for key, value, reason in variants:
+            with self.subTest(key=key, value=value):
+                p, _ = fixture(3)
+                event = dict(base_event, **{key: value})
+                data = {"source_hash": "hash", "geometry_revision": "geometry",
+                        "page_role": "story", "extraction_status": "complete",
+                        "events": [event]}
+                transformations = {"schema_version": 1, "chapters": {
+                    "chapter_001": {"page.png": data}}}
+                result = resolve_prepared(p, transformations=transformations)
+                proposal = result["transformation_proposals"][0]
+                self.assertEqual(proposal["status"], "pending_review")
+                self.assertEqual(proposal["automatic_rejection_reason"], reason)
+                self.assertEqual(result["identities"], [])
+
+    def test_automatic_transformation_rejects_ambiguous_or_conflicting_endpoints(self):
+        event = {
+            "type": "transformation", "source_panel": 1, "target_panel": 2,
+            "source_description": "a horned figure",
+            "target_description": "a winged dragon",
+            "evidence": "The same body visibly grows wings.",
+            "evidence_type": "visible_change", "confidence_percent": 100,
+        }
+        data = {"source_hash": "hash", "geometry_revision": "geometry",
+                "page_role": "story", "extraction_status": "complete",
+                "events": [event]}
+        transformations = {"schema_version": 1, "chapters": {
+            "chapter_001": {"page.png": data}}}
+
+        ambiguous, _ = fixture(3)
+        ambiguous["instances"][2]["panel_number"] = 1
+        result = resolve_prepared(ambiguous, transformations=transformations)
+        self.assertEqual(
+            result["transformation_proposals"][0]["automatic_rejection_reason"],
+            "exactly_one_instance_per_endpoint_required",
+        )
+        self.assertEqual(result["identities"], [])
+
+        conflicting, reviews = fixture(2)
+        reviews["assignments"][1].update(entity_id="villain", form_id="dragon")
+        result = resolve_prepared(
+            conflicting,
+            reviews=reviews,
+            transformations=transformations,
+        )
+        self.assertEqual(
+            result["transformation_proposals"][0]["automatic_rejection_reason"],
+            "conflicting_accepted_entities",
+        )
+        self.assertEqual(len(result["identities"]), 2)
+
     def test_description_role_requires_current_provenance_and_preserves_review(self):
         p, _ = fixture(2)
         for item in p["instances"]:

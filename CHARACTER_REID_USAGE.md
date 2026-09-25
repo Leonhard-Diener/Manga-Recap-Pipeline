@@ -76,7 +76,8 @@ views, and a timestamped `reid_runs/` snapshot containing an HTML review gallery
 contact sheets, the reviews used, and an empty review template. Previous
 classification exports are backed up in the new run directory before replacement.
 The gallery links each crop to a saved copy of its original page and displays
-pending form-change events when a description export is available.
+form-change evidence and its pending or automatically accepted status when a
+description export is available.
 
 `output/<manga>/character_identities.sqlite3` keeps resolution revisions, review
 decisions, page/panel manifests, instances, entities, groups, and event evidence.
@@ -194,7 +195,10 @@ deterministic pseudorandom display name from `story_entities/manga_names.json`.
 The pool contains 200 common Japanese surnames, which are gender-neutral and
 natural character references in manga. Ungrouped observations receive no display
 name. These additive `display_name` fields do not replace reviewed canonical
-entity names.
+entity names. When several retained visual groups are already assigned to the
+same accepted entity, such as reviewed human and creature forms, they share one
+entity-scoped display name. Pending transformation proposals never join forms or
+share names by themselves.
 
 Count distinct accepted story-panel appearances across all chapters and forms.
 Multiple crops in one panel count once. At 1-3 panels, no name is released. At
@@ -225,20 +229,27 @@ justify guessing gender; use a grounded descriptor, pronoun, or generic wording.
 
 ## 6. Transformation proposals from descriptions
 
-If the combined description JSON contains `transformations`, its successfully extracted events
-are attached as `transformation_proposals`, with possible source/target crop IDs
-based on panel numbers. They always remain `pending_review`, regardless of model
-confidence. Every crop in that panel is only a candidate, not a resolved actor.
-Incomplete description pages are ignored for identity decisions. The current
-description pass cannot infer cross-page transformations. Event files also lack
-identity decisions: a human must still inspect source pages before accepting a
-form bridge. New events include source-image hashes and panel-geometry revisions.
-Only exact matches receive candidate instance IDs. Stale or legacy unverified
-events remain visible with empty candidates; they never remap to changed pages.
+If the combined description JSON contains `transformations`, its successfully
+extracted events are attached as `transformation_proposals`, with source/target
+crop candidates based on panel numbers. A transformation, reversion, or disguise
+reveal can automatically connect two forms only when Qwen reports exactly 100%
+certainty and direct visible-change evidence, the panels are adjacent, hashes and
+geometry are current, each endpoint panel has exactly one high-quality instance,
+both are story panels, and no accepted identity or reviewed-different constraint
+conflicts. Accepted events use `status: accepted_automatic`; every failed gate
+keeps `status: pending_review` and records `automatic_rejection_reason`.
+
+Possession, summoning, splitting, and fusion never establish same identity.
+Incomplete pages, text-only evidence, ambiguous sequences, non-adjacent panels,
+and stale or legacy events cannot affect identities. The current description
+pass still cannot infer cross-page transformations. Qwen's 100% value is a
+strict application gate, not a guarantee that the model is objectively correct.
 
 `test_description.py` writes transformations inside the same description JSON,
 using one page-generation call. It checks expected panel coverage against
-the manifest and preserves raw responses for inspection.
+the manifest and preserves raw responses for inspection. New events include
+`confidence_percent`; older exports without it remain pending until descriptions
+are regenerated.
 
 ## 7. Creature detection and remaining limitations
 

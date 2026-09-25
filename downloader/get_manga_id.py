@@ -1,9 +1,9 @@
-import requests
 import config
+from downloader.mangadex_api import get
 
 
 def get_manga_id(title):
-    response = requests.get(
+    response = get(
         config.BASE_URL,
         params={
             "title": title,

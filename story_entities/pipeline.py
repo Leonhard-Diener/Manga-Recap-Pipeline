@@ -333,6 +333,159 @@ def add_style_evidence(prepared: dict, encoder: Encoder, cache_dir: Path) -> dic
     return prepared
 
 
+_AUTO_IDENTITY_EVENT_TYPES = {"transformation", "reversion", "disguise_reveal"}
+
+
+def _build_transformation_proposals(instances: list[dict], transformations: dict | None) -> list[dict]:
+    """Ground model events to current instance candidates without accepting them."""
+    events = []
+    if not transformations:
+        return events
+    for chapter, pages in transformations.get("chapters", {}).items():
+        for page, data in pages.items():
+            if data.get("extraction_status") != "complete":
+                continue
+            matching = [row for row in instances
+                        if row["chapter"] == chapter and Path(row["page"]).name == page]
+            provenance = bool(data.get("source_hash") and data.get("geometry_revision"))
+            current = provenance and any(
+                row.get("page_hash") == data["source_hash"]
+                and row.get("geometry_revision") == data["geometry_revision"]
+                for row in matching
+            )
+            for event in data.get("events", []):
+                proposal = dict(event)
+                proposal.update(
+                    chapter=chapter,
+                    page=page,
+                    status="pending_review",
+                    source_hash=data.get("source_hash"),
+                    geometry_revision=data.get("geometry_revision"),
+                    grounding_status="current" if current else "stale_or_unverified",
+                )
+                proposal["candidate_instances"] = {
+                    side: [
+                        row["instance_id"] for row in matching
+                        if current and row["panel_number"] == event.get(side + "_panel")
+                    ]
+                    for side in ("source", "target")
+                }
+                proposal["event_id"] = stable_id(
+                    "event_", chapter, page, data.get("source_hash"),
+                    data.get("geometry_revision"), event,
+                )
+                events.append(proposal)
+    return events
+
+
+def _automatic_transformation_assignments(
+    result: dict,
+    events: list[dict],
+    reviews: dict | None,
+) -> dict:
+    """Accept only uniquely grounded, direct, 100%-certain visible changes."""
+    by_id = {row["instance_id"]: row for row in result["characters"]}
+    blocked = {
+        frozenset((entry.get("left"), entry.get("right")))
+        for entry in (reviews or {}).get("different", [])
+        if isinstance(entry, dict) and entry.get("left") and entry.get("right")
+    }
+    parent: dict[str, str] = {}
+
+    def find(value: str) -> str:
+        parent.setdefault(value, value)
+        while parent[value] != value:
+            parent[value] = parent[parent[value]]
+            value = parent[value]
+        return value
+
+    accepted_events = []
+    for event in sorted(events, key=lambda row: row["event_id"]):
+        reason = None
+        candidates = event.get("candidate_instances", {})
+        source_ids = candidates.get("source", [])
+        target_ids = candidates.get("target", [])
+        source_panel = event.get("source_panel")
+        target_panel = event.get("target_panel")
+        if event.get("type") not in _AUTO_IDENTITY_EVENT_TYPES:
+            reason = "event_type_does_not_prove_same_identity"
+        elif event.get("grounding_status") != "current":
+            reason = "stale_or_unverified_grounding"
+        elif event.get("confidence_percent") != 100:
+            reason = "model_certainty_below_100"
+        elif event.get("evidence_type") != "visible_change":
+            reason = "direct_visible_change_required"
+        elif (type(source_panel) is not int or type(target_panel) is not int
+              or abs(source_panel - target_panel) != 1):
+            reason = "adjacent_endpoint_panels_required"
+        elif len(source_ids) != 1 or len(target_ids) != 1:
+            reason = "exactly_one_instance_per_endpoint_required"
+        else:
+            source_id, target_id = source_ids[0], target_ids[0]
+            source, target = by_id.get(source_id), by_id.get(target_id)
+            if source is None or target is None or source_id == target_id:
+                reason = "distinct_known_endpoints_required"
+            elif not source.get("prototype_eligible") or not target.get("prototype_eligible"):
+                reason = "high_quality_endpoints_required"
+            elif source.get("page_role") != "story" or target.get("page_role") != "story":
+                reason = "story_page_endpoints_required"
+            else:
+                left_root, right_root = find(source_id), find(target_id)
+                members = {
+                    identity for identity in parent
+                    if find(identity) in (left_root, right_root)
+                }
+                members.update((source_id, target_id))
+                entities = {by_id[identity].get("entity_id") for identity in members
+                            if by_id[identity].get("entity_id")}
+                if len(entities) > 1:
+                    reason = "conflicting_accepted_entities"
+                elif any(pair.issubset(members) for pair in blocked):
+                    reason = "reviewed_different_identity_constraint"
+                else:
+                    parent[right_root] = left_root
+                    accepted_events.append(event)
+
+        if reason is not None:
+            event["automatic_rejection_reason"] = reason
+            continue
+        event.update(
+            status="accepted_automatic",
+            acceptance_policy="qwen_direct_visible_change_v1",
+            accepted_instance_ids=[source_ids[0], target_ids[0]],
+        )
+
+    if not accepted_events:
+        return {}
+
+    components: dict[str, set[str]] = {}
+    for identity in parent:
+        components.setdefault(find(identity), set()).add(identity)
+    assignments = {}
+    for members in components.values():
+        supporting = [event for event in accepted_events
+                      if set(event["accepted_instance_ids"]).issubset(members)]
+        if not supporting:
+            continue
+        entities = {by_id[identity].get("entity_id") for identity in members
+                    if by_id[identity].get("entity_id")}
+        entity_id = (next(iter(entities)) if entities else
+                     stable_id("entity_qwen_", sorted(members)))
+        event_ids = sorted(event["event_id"] for event in supporting)
+        evidence = "Qwen 100% direct visible change: " + ", ".join(event_ids)
+        for identity in sorted(members):
+            row = by_id[identity]
+            assignments[identity] = {
+                "entity_id": entity_id,
+                "form_id": row.get("form_id") or stable_id(
+                    "form_qwen_", row.get("visual_group_id") or identity
+                ),
+                "evidence": evidence,
+                "event_ids": event_ids,
+            }
+    return assignments
+
+
 def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transformations=None):
     """Rebuild decisions using current reviews; never load any model here."""
     start = time.perf_counter()
@@ -359,53 +512,44 @@ def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transfor
                     flags.add("non_story_or_unknown_role")
                 instance["quality_flags"] = sorted(flags)
                 instance["prototype_eligible"] = not flags
-    result = resolve(instances, distances, reviews=reviews,
-                     group_threshold=prepared["group_threshold"], calibration=calibration,
-                     assignment_group_threshold=prepared.get("assignment_group_threshold", .14),
-                     style_distances=prepared.get("style_distances"))
+    resolver_kwargs = {
+        "reviews": reviews,
+        "group_threshold": prepared["group_threshold"],
+        "calibration": calibration,
+        "assignment_group_threshold": prepared.get("assignment_group_threshold", .14),
+        "style_distances": prepared.get("style_distances"),
+    }
+    result = resolve(instances, distances, **resolver_kwargs)
+    events = _build_transformation_proposals(instances, transformations)
+    automatic_assignments = _automatic_transformation_assignments(result, events, reviews)
+    if automatic_assignments:
+        result = resolve(
+            instances,
+            distances,
+            automatic_assignments=automatic_assignments,
+            **resolver_kwargs,
+        )
     result["warnings"] = warnings + result["warnings"]
     assign_group_display_names(result, prepared["manga"])
     if calibration is None:
-        result["warnings"].append("No validated calibration: visual groups are proposals. Only reviewed instances receive canonical identities.")
-    events = []
-    if transformations:
-        if transformations.get("schema_version") != 1:
-            raise ValueError("Unsupported transformation schema.")
-        for chapter, pages in transformations.get("chapters", {}).items():
-            for page, data in pages.items():
-                if data.get("extraction_status") != "complete":
-                    continue
-                for event in data.get("events", []):
-                    proposal = dict(event)
-                    provenance = bool(data.get("source_hash") and data.get("geometry_revision"))
-                    matching_instances = [x for x in instances if x["chapter"] == chapter
-                                          and Path(x["page"]).name == page]
-                    current = provenance and any(x.get("page_hash") == data["source_hash"]
-                                                 and x.get("geometry_revision") == data["geometry_revision"]
-                                                 for x in matching_instances)
-                    proposal.update(chapter=chapter, page=page, status="pending_review",
-                                    source_hash=data.get("source_hash"), geometry_revision=data.get("geometry_revision"),
-                                    grounding_status="current" if current else "stale_or_unverified")
-                    proposal["candidate_instances"] = {
-                        side: [x["instance_id"] for x in matching_instances if current
-                               and x["panel_number"] == event.get(side + "_panel")]
-                        for side in ("source", "target")}
-                    proposal["event_id"] = stable_id("event_", chapter, page, data.get("source_hash"),
-                                                    data.get("geometry_revision"), event)
-                    events.append(proposal)
+        result["warnings"].append(
+            "No validated calibration: visual groups are proposals. Canonical identities require "
+            "review or a strictly accepted Qwen transformation."
+        )
     result.update(schema_version=2, manga=prepared["manga"], encoder=prepared["encoder"],
                   encoder_fingerprint=prepared["encoder_fingerprint"], provider=prepared["provider"],
                   style_linker={"encoder": prepared.get("style_encoder"),
                                 "encoder_fingerprint": prepared.get("style_encoder_fingerprint"),
                                 "provider": prepared.get("style_provider"),
                                 "policy": "dual_encoder_anchor_v2" if prepared.get("style_distances") is not None else None},
-                  acceptance_policy={"rule_version": "resolver_v5",
+                  acceptance_policy={"rule_version": "resolver_v6",
                                      "proposal_distance": prepared["group_threshold"],
                                      "assignment_group_distance": prepared.get("assignment_group_threshold", .14),
-                                     "calibration": calibration},
+                                     "calibration": calibration,
+                                     "automatic_transformation": "qwen_direct_visible_change_v1"},
                   input_chapters=prepared["chapters"], transformation_proposals=events,
                   elapsed_seconds=round(prepared["elapsed_seconds"] + time.perf_counter() - start, 3))
-    result["revision"] = stable_id("revision_", "resolver_v5", prepared["encoder_fingerprint"],
+    result["revision"] = stable_id("revision_", "resolver_v6", prepared["encoder_fingerprint"],
                                    prepared["group_threshold"], reviews, calibration,
                                    prepared.get("assignment_group_threshold", .14),
                                    prepared.get("style_encoder_fingerprint"), result["style_links"],

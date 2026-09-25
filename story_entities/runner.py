@@ -37,7 +37,8 @@ def export_review_gallery(result: dict, crops: list[Image.Image], directory: Pat
               '<style>body{font:15px system-ui;background:#eee;padding:20px}section{background:white;padding:15px;margin:15px 0}article{display:inline-block;vertical-align:top;width:245px;margin:6px;overflow-wrap:anywhere}img{width:240px;height:240px;object-fit:contain}code{font-size:11px}</style>',
               '<h1>Visual proposals (not confirmed identities)</h1>',
               '<p>Review individual crops before assigning IDs. A group may contain mistakes. '
-              'Copy exact instance IDs into the review file; pending model events never merge identities.</p>']
+              'Copy exact instance IDs into the review file. Only events passing every strict automatic '
+              'transformation gate can connect forms; all others remain pending.</p>']
     groups = [g for g in result["visual_groups"] if g["size"] > 1]
     grouped = {identity for group in groups for identity in group["instance_ids"]}
     ungrouped = [r for r in result["characters"] if r["instance_id"] not in grouped]
@@ -60,7 +61,7 @@ def export_review_gallery(result: dict, crops: list[Image.Image], directory: Pat
                       f'<a href="ungrouped.html">{len(ungrouped)} ungrouped observations</a> retained separately.</p>')
     events = result.get("transformation_proposals", [])
     if events:
-        chunks.append('<section><h2>Possible form changes and related events — pending review</h2>')
+        chunks.append('<section><h2>Possible form changes and related events</h2>')
         for event in events:
             title = f"{event.get('type')} — {event.get('chapter')}/{event.get('page')}"
             chunks.append('<h3>' + html.escape(title) + '</h3><p>' + html.escape(event.get("evidence", "")) + '</p>')
@@ -68,7 +69,12 @@ def export_review_gallery(result: dict, crops: list[Image.Image], directory: Pat
                 links = ' '.join(f'<a href="{"" if identity in grouped else "ungrouped.html"}#{html.escape(identity, quote=True)}">{html.escape(identity)}</a>'
                                  for identity in event.get("candidate_instances", {}).get(side, []))
                 chunks.append('<p>' + side + ': ' + html.escape(event.get(side + "_description", "")) + '<br>' + links + '</p>')
-            chunks.append('<small>' + html.escape(event.get("grounding_status", "unverified")) + '</small>')
+            status = event.get("status", "pending_review")
+            reason = event.get("automatic_rejection_reason")
+            details = status + " / " + event.get("grounding_status", "unverified")
+            if reason:
+                details += " / " + reason
+            chunks.append('<small>' + html.escape(details) + '</small>')
         chunks.append('</section>')
     for group in sorted(groups, key=lambda g: (-g["size"], g["group_id"])):
         link_note = (f' — {len(group.get("style_links", []))} simple/detail subgroup link(s)'
