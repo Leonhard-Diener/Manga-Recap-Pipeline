@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 
@@ -13,6 +14,8 @@ def write_json(path: Path, data) -> None:
         temporary = Path(stream.name)
         try:
             json.dump(data, stream, indent=2, ensure_ascii=False, allow_nan=False)
+            stream.flush()
+            os.fsync(stream.fileno())
         except BaseException:
             stream.close()
             temporary.unlink(missing_ok=True)

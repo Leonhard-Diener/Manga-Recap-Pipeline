@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from copy import deepcopy
 from pathlib import Path
@@ -9,8 +10,10 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageOps
 
+import config
+from description.quality import action_issues, character_description_is_useful, text_issues
 from common.utils import natural_sort_key, list_images
-from .matching import resolve, stable_id
+from .matching import resolve, stable_id, story_panel
 from .manifest import file_hash
 from .naming import assign_group_display_names
 
@@ -54,7 +57,9 @@ def collect_instances(manga_dir: Path, chapters: list[Path], output_dir: Path):
             found = True
             seen_sources.add(source)
             if source == "body":
-                rows = [dict(c, page=p["page"], source_hash=p.get("source_hash"))
+                rows = [dict(c, page=p["page"], source_hash=p.get("source_hash"),
+                             geometry_revision=p.get("geometry_revision"),
+                             grounding_revision=p.get("grounding_revision"))
                         for p in data for c in p.get("characters", [])]
             else:
                 rows = data.get("detections", [])
@@ -76,7 +81,10 @@ def collect_instances(manga_dir: Path, chapters: list[Path], output_dir: Path):
                 if not np.isfinite(box + [score]).all():
                     continue
                 proposals.setdefault(path, []).append({"box": box, "score": score, "source": source,
-                                                       "source_hash": entry.get("source_hash")})
+                                                       "source_hash": entry.get("source_hash"),
+                                                       "grounding_revision": entry.get("grounding_revision"),
+                                                       "grounding_id": entry.get("detection_id"),
+                                                       "grounding_label": entry.get("label")})
         if not found:
             raise FileNotFoundError(f"No entity proposals for {chapter.name}; run test_panels.py first.")
         for page_index, path in enumerate(sorted(proposals, key=natural_sort_key)):
@@ -99,9 +107,20 @@ def collect_instances(manga_dir: Path, chapters: list[Path], output_dir: Path):
                     if duplicate:
                         duplicate["sources"].add(proposal["source"])
                         duplicate["verified_source"] |= proposal["source_hash"] == digest
+                        if proposal.get("grounding_revision"):
+                            duplicate["grounding_revision"] = proposal["grounding_revision"]
+                        if isinstance(proposal.get("grounding_id"), str):
+                            duplicate["grounding_ids"].add(proposal["grounding_id"])
+                        if isinstance(proposal.get("grounding_label"), str):
+                            duplicate["grounding_labels"].add(proposal["grounding_label"])
                         continue
                     valid.append({"box": box, "score": proposal["score"], "sources": {proposal["source"]},
-                                  "verified_source": proposal["source_hash"] == digest})
+                                  "verified_source": proposal["source_hash"] == digest,
+                                  "grounding_revision": proposal.get("grounding_revision"),
+                                  "grounding_ids": ({proposal["grounding_id"]}
+                                                    if isinstance(proposal.get("grounding_id"), str) else set()),
+                                  "grounding_labels": ({proposal["grounding_label"]}
+                                                       if isinstance(proposal.get("grounding_label"), str) else set())})
                 panel_data = page_panels.get(path.name, {})
                 # Do not use stale geometry from a different edition/image.
                 if panel_data.get("source_hash") != digest:
@@ -118,7 +137,7 @@ def collect_instances(manga_dir: Path, chapters: list[Path], output_dir: Path):
                         flags.append("unverified_detection_source")
                     if min(box[2] - box[0], box[3] - box[1]) < 48 or area(box) < 4096:
                         flags.append("tiny")
-                    if proposal["score"] < .65:
+                    if proposal["score"] < config.CHARACTER_LABEL_CONFIDENCE:
                         flags.append("low_detector_score")
                     if panel is None:
                         flags.append("uncertain_panel")
@@ -145,6 +164,7 @@ def collect_instances(manga_dir: Path, chapters: list[Path], output_dir: Path):
                                       "page": str(path.resolve()), "page_hash": digest,
                                       "page_id": panel_data.get("page_id"),
                                       "geometry_revision": panel_data.get("geometry_revision"),
+                                      "grounding_revision": proposal.get("grounding_revision"),
                                       "character_index": index + 1, "box": box,
                                       "panel_id": panel_id, "panel_number": panel,
                                       "story_panel_id": stable_id("story_panel_", digest, panel_record["box"]) if panel else None,
@@ -153,8 +173,12 @@ def collect_instances(manga_dir: Path, chapters: list[Path], output_dir: Path):
                                       "page_role": panel_data.get("page_role", "uncertain"),
                                       "page_role_source": panel_data.get("page_role_source", "review"),
                                       "detector_score": proposal["score"], "sources": sorted(proposal["sources"]),
+                                      "grounding_ids": sorted(proposal["grounding_ids"]),
+                                      "grounding_labels": sorted(proposal["grounding_labels"]),
                                       "quality_flags": flags, "prototype_eligible": not flags,
-                                      "embedding_eligible": not (set(flags) - {"non_story_or_unknown_role"})})
+                                      "embedding_eligible": not (set(flags) - {"non_story_or_unknown_role"}),
+                                      "narration_eligibility": "uncertain",
+                                      "narration_eligibility_source": "unreviewed_body_proposal"})
                     crop.thumbnail((768, 768), Image.Resampling.LANCZOS)
                     crops.append(crop)
     if "entity" not in seen_sources:
@@ -351,6 +375,7 @@ def _build_transformation_proposals(instances: list[dict], transformations: dict
             current = provenance and any(
                 row.get("page_hash") == data["source_hash"]
                 and row.get("geometry_revision") == data["geometry_revision"]
+                and row.get("grounding_revision") == data.get("grounding_revision")
                 for row in matching
             )
             for event in data.get("events", []):
@@ -361,18 +386,35 @@ def _build_transformation_proposals(instances: list[dict], transformations: dict
                     status="pending_review",
                     source_hash=data.get("source_hash"),
                     geometry_revision=data.get("geometry_revision"),
+                    grounding_revision=data.get("grounding_revision"),
                     grounding_status="current" if current else "stale_or_unverified",
                 )
-                proposal["candidate_instances"] = {
-                    side: [
-                        row["instance_id"] for row in matching
-                        if current and row["panel_number"] == event.get(side + "_panel")
-                    ]
+                exact_grounding = all(
+                    isinstance(event.get(side + "_detection_id"), str)
                     for side in ("source", "target")
-                }
+                )
+                if exact_grounding:
+                    proposal["candidate_instances"] = {
+                        side: [
+                            row["instance_id"] for row in matching
+                            if current and event[side + "_detection_id"] in row.get("grounding_ids", [])
+                            and row["panel_number"] == event.get(side + "_panel")
+                        ]
+                        for side in ("source", "target")
+                    }
+                    proposal["grounding_method"] = "labeled_detection"
+                else:
+                    proposal["candidate_instances"] = {
+                        side: [
+                            row["instance_id"] for row in matching
+                            if current and row["panel_number"] == event.get(side + "_panel")
+                        ]
+                        for side in ("source", "target")
+                    }
+                    proposal["grounding_method"] = "legacy_panel_candidates"
                 proposal["event_id"] = stable_id(
                     "event_", chapter, page, data.get("source_hash"),
-                    data.get("geometry_revision"), event,
+                    data.get("geometry_revision"), data.get("grounding_revision"), event,
                 )
                 events.append(proposal)
     return events
@@ -486,7 +528,548 @@ def _automatic_transformation_assignments(
     return assignments
 
 
-def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transformations=None):
+def _grounding_index(characters: list[dict]) -> dict[str, list[dict]]:
+    index: dict[str, list[dict]] = {}
+    for character in characters:
+        for detection_id in character.get("grounding_ids", []):
+            index.setdefault(detection_id, []).append(character)
+    return index
+
+
+def _current_description_page(data: dict, matching: list[dict]) -> bool:
+    return bool(
+        data.get("extraction_status") in {"complete", "complete_with_uncertainty"}
+        and data.get("source_hash")
+        and data.get("geometry_revision")
+        and any(
+            row.get("page_hash") == data["source_hash"]
+            and row.get("geometry_revision") == data["geometry_revision"]
+            and row.get("grounding_revision") == data.get("grounding_revision")
+            for row in matching
+        )
+    )
+
+
+def _apply_grounded_descriptions(result: dict, descriptions: dict | None) -> None:
+    """Attach Qwen appearance phrases through exact labeled detections."""
+    if not descriptions:
+        return
+    characters = result.get("characters", [])
+    by_grounding = _grounding_index(characters)
+    for chapter, pages in descriptions.items():
+        if not isinstance(pages, dict):
+            continue
+        for page, data in pages.items():
+            if not isinstance(data, dict):
+                continue
+            matching = [row for row in characters
+                        if row.get("chapter") == chapter and Path(row.get("page", "")).name == page]
+            if not _current_description_page(data, matching):
+                continue
+            panel_context = {
+                panel.get("panel_number"): panel.get("description")
+                for panel in data.get("panels", []) if isinstance(panel, dict)
+            }
+            for row in matching:
+                context = panel_context.get(row.get("panel_number"))
+                if isinstance(context, str) and context.strip():
+                    row["panel_description_context"] = context
+            for descriptor in data.get("characters", []):
+                detection_id = descriptor.get("detection_id")
+                candidates = [row for row in by_grounding.get(detection_id, []) if row in matching]
+                visual = descriptor.get("visual_description")
+                if len(candidates) != 1 or not isinstance(visual, str) or not visual.strip():
+                    continue
+                candidates[0].update(
+                    visual_description=visual,
+                    visual_description_status="qwen_labeled_observation",
+                    visual_description_detection_id=detection_id,
+                )
+                representation = descriptor.get("representation_type")
+                if representation in {"live_character", "toy", "statue", "image", "uncertain"}:
+                    candidates[0].update(
+                        representation_type=representation,
+                        representation_status=descriptor.get(
+                            "representation_status", "model_observation",
+                        ),
+                    )
+                if candidates[0].get("narration_eligibility") in (None, "uncertain"):
+                    candidates[0].update(
+                        narration_eligibility="eligible_automatic",
+                        narration_eligibility_source="body_observation_format_v2",
+                    )
+
+def _apply_eligibility_reviews(result: dict, reviews: dict | None) -> None:
+    """Apply exact, source-bound narration decisions without deleting instances."""
+    by_id = {row["instance_id"]: row for row in result.get("characters", [])}
+    for correction in (reviews or {}).get("appearance_corrections", []):
+        if (not isinstance(correction, dict)
+                or correction.get("status") != "accepted_reviewed"):
+            raise ValueError("Appearance correction must be accepted_reviewed.")
+        row = by_id.get(correction.get("instance_id"))
+        text = correction.get("text")
+        if (row is None or not _review_source_matches(correction, row)
+                or not isinstance(text, str)
+                or not character_description_is_useful(text)):
+            raise ValueError("Appearance correction has stale or invalid evidence.")
+        row.update(
+            visual_description=text.strip(),
+            visual_description_status="reviewed_observation",
+        )
+    seen = set()
+    for decision in (reviews or {}).get("eligibility", []):
+        if not isinstance(decision, dict):
+            raise ValueError("Eligibility review must be an object.")
+        instance_id = decision.get("instance_id")
+        row = by_id.get(instance_id)
+        value = decision.get("decision")
+        if instance_id in seen or row is None:
+            raise ValueError("Eligibility review references a missing or duplicate instance.")
+        seen.add(instance_id)
+        if value not in {"eligible", "uncertain", "rejected_non_character"}:
+            raise ValueError("Eligibility review has an invalid decision.")
+        if any(decision.get(key) != row.get(row_key) for key, row_key in (
+            ("source_hash", "page_hash"),
+            ("geometry_revision", "geometry_revision"),
+            ("grounding_revision", "grounding_revision"),
+        )):
+            raise ValueError(f"Stale eligibility review for {instance_id}.")
+        row.update(
+            narration_eligibility=("reviewed_eligible" if value == "eligible" else value),
+            narration_eligibility_source="reviewed_narration_eligibility_v1",
+            narration_eligibility_reason=decision.get("reason"),
+        )
+
+
+def _apply_stable_descriptions(result: dict) -> None:
+    """Share descriptions only across accepted entity/form membership."""
+    characters = result.get("characters", [])
+    confirmed = {}
+    for row in characters:
+        if (row.get("entity_id") and row.get("form_id")
+                and row.get("identity_status") != "unknown"):
+            confirmed.setdefault((row["entity_id"], row["form_id"]), []).append(row)
+    for rows in confirmed.values():
+        candidates = [row for row in rows if row.get("visual_description")]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda row: (
+            row.get("visual_description_status") != "reviewed_observation",
+            row.get("reading_position") or [10**9], row["instance_id"],
+        ))
+        stable = candidates[0]["visual_description"]
+        source = candidates[0].get("visual_description_status")
+        for row in rows:
+            row.update(stable_description=stable, stable_description_source=source)
+    for row in characters:
+        if not row.get("stable_description") and row.get("visual_description"):
+            row.update(
+                stable_description=row["visual_description"],
+                stable_description_source=row.get("visual_description_status"),
+            )
+
+
+_REPRESENTATION_PATTERNS = {
+    "toy": re.compile(
+        r"\b(?:toy|figurine|action figure|miniature|doll|plush|capsule figure|"
+        r"small figure of|model figure)\b", re.IGNORECASE,
+    ),
+    "statue": re.compile(r"\b(?:statue|sculpture|mannequin)\b", re.IGNORECASE),
+    "image": re.compile(
+        r"\b(?:photograph|photo of|portrait of|poster|printed image|on (?:a )?screen|"
+        r"on (?:the )?packag(?:e|ing))\b", re.IGNORECASE,
+    ),
+}
+
+
+def _classify_representation_types(result: dict) -> None:
+    """Separate visible people from toys and other depictions before identity promotion.
+
+    This deliberately abstains when no grounded character description exists. A
+    representation may resemble a character, but resemblance is not evidence
+    that the represented object is the live narrative actor.
+    """
+    for row in result.get("characters", []):
+        description = row.get("visual_description") or ""
+        lexical = next(
+            (kind for kind, pattern in _REPRESENTATION_PATTERNS.items()
+             if pattern.search(description)),
+            None,
+        )
+        observed = row.get("representation_type")
+        context = row.get("panel_description_context") or ""
+        contextual_toy = bool(
+            re.search(r"\b(?:toy|figurine|doll|capsule figure)s?\b", context, re.IGNORECASE)
+            and re.search(r"\b(?:figure|armou?red|miniature|small)\b", description, re.IGNORECASE)
+        )
+        representation = (
+            lexical or ("toy" if contextual_toy else None)
+            or (observed if observed in {
+                "live_character", "toy", "statue", "image", "uncertain",
+            } else None)
+            or ("live_character" if description.strip() else "uncertain")
+        )
+        row["representation_type"] = representation
+        row["representation_policy"] = (
+            "grounded_appearance_representation_v2"
+            if observed in {"live_character", "toy", "statue", "image", "uncertain"}
+            else "grounded_appearance_representation_v1_fallback"
+        )
+
+
+def _box_iou(left, right) -> float:
+    if not (isinstance(left, list) and isinstance(right, list)
+            and len(left) == len(right) == 4):
+        return 0.0
+    overlap = intersection(left, right)
+    union = area(left) + area(right) - overlap
+    return overlap / union if union > 0 else 0.0
+
+
+def _appearance_traits(text: str | None) -> dict[str, str]:
+    """Extract only explicit contradictions; absence of a trait proves nothing."""
+    words = set(re.findall(r"[a-z]+", str(text or "").lower()))
+    traits = {}
+    if words & {"girl", "woman", "female"}:
+        traits["presentation"] = "female"
+    elif words & {"boy", "man", "male"}:
+        traits["presentation"] = "male"
+    colours = {
+        "dark": {"dark", "black"}, "light": {"light", "white", "blonde", "blond"},
+        "red": {"red"}, "blue": {"blue"}, "green": {"green"},
+    }
+    mentioned = [name for name, values in colours.items() if words & values]
+    if len(mentioned) == 1 and "hair" in words:
+        traits["hair_colour"] = mentioned[0]
+    return traits
+
+
+def _automatic_identity_conflict(left: dict, right: dict) -> bool:
+    if left.get("representation_type") != right.get("representation_type"):
+        return True
+    # Manga panels can depict the same character more than once (for example a
+    # full body beside an inset close-up), so co-presence alone is not a safe
+    # cannot-link. Only explicit grounded trait contradictions are used here.
+    a = _appearance_traits(left.get("visual_description"))
+    b = _appearance_traits(right.get("visual_description"))
+    return any(key in a and key in b and a[key] != b[key] for key in set(a) | set(b))
+
+
+def _promote_automatic_identities(result: dict, distances: np.ndarray, *,
+                                  proposal_threshold: float,
+                                  strict_threshold: float,
+                                  style_distances: np.ndarray | None = None) -> None:
+    """Confirm recurrent, contradiction-free cores inside visual proposals.
+
+    A display proposal is not accepted wholesale. Toys and uncertain instances
+    are removed first, then a two-neighbour core is built from independently
+    agreeing primary/style edges. This prevents one weak bridge from turning a
+    chain of lookalikes into a canonical identity.
+    """
+    rows = result.get("characters", [])
+    if not rows:
+        return
+    eligible = {
+        index for index, row in enumerate(rows)
+        if row.get("entity_id") is None
+        and row.get("prototype_eligible")
+        and row.get("narration_eligibility") in {"eligible_automatic", "reviewed_eligible"}
+        and row.get("representation_type") == "live_character"
+        and row.get("visual_description")
+    }
+    index_by_id = {row["instance_id"]: index for index, row in enumerate(rows)}
+    accepted = []
+    for proposal in result.get("visual_groups", []):
+        proposal_indices = [
+            index_by_id[instance_id] for instance_id in proposal.get("instance_ids", [])
+            if instance_id in index_by_id
+        ]
+        # Reviewed/transformation identities take precedence. Do not create a
+        # second automatic entity beside accepted membership in one proposal.
+        if any(rows[index].get("entity_id") is not None for index in proposal_indices):
+            continue
+        described = [index for index in proposal_indices
+                     if rows[index].get("narration_eligibility") in {
+                         "eligible_automatic", "reviewed_eligible",
+                     }
+                     and rows[index].get("visual_description")]
+        members = [index for index in described if index in eligible]
+        if not described or len(members) / len(described) < .7:
+            continue
+        edge_threshold = proposal_threshold if style_distances is not None else strict_threshold
+        adjacency = {index: set() for index in members}
+        for offset, left in enumerate(members):
+            for right in members[offset + 1:]:
+                if (_automatic_identity_conflict(rows[left], rows[right])
+                        or float(distances[left, right]) > edge_threshold):
+                    continue
+                if (style_distances is not None
+                        and float(style_distances[left, right]) > .18):
+                    continue
+                adjacency[left].add(right)
+                adjacency[right].add(left)
+        # Iterative two-neighbour pruning gives every accepted occurrence more
+        # than one independent visual bridge and removes dangling satellites.
+        core = set(members)
+        while True:
+            remove = {
+                index for index in core
+                if len({story_panel(rows[other]) for other in adjacency[index] & core
+                        if story_panel(rows[other]) != story_panel(rows[index])}) < 2
+            }
+            if not remove:
+                break
+            core -= remove
+        components = []
+        unseen = set(core)
+        while unseen:
+            seed = min(unseen, key=lambda index: rows[index]["instance_id"])
+            component, stack = set(), [seed]
+            while stack:
+                index = stack.pop()
+                if index in component:
+                    continue
+                component.add(index)
+                stack.extend((adjacency[index] & core) - component)
+            unseen -= component
+            components.append(sorted(component, key=lambda index: rows[index]["instance_id"]))
+        for members in components:
+            if any(_automatic_identity_conflict(rows[left], rows[right])
+                   for offset, left in enumerate(members) for right in members[offset + 1:]):
+                continue
+            panels = {story_panel(rows[index]) for index in members if story_panel(rows[index])}
+            if len(members) < 3 or len(panels) < 3:
+                continue
+            internal = [float(distances[i, j]) for offset, i in enumerate(members)
+                        for j in members[offset + 1:] if j in adjacency[i]]
+            if not internal:
+                continue
+            trait_panels = {}
+            for index in members:
+                for key, value in _appearance_traits(rows[index].get("visual_description")).items():
+                    trait_panels.setdefault((key, value), set()).add(story_panel(rows[index]))
+            corroborated_traits = sorted(
+                f"{key}:{value}" for (key, value), supporting_panels in trait_panels.items()
+                if len(supporting_panels - {None}) >= 2
+            )
+            if not corroborated_traits:
+                continue
+            style_support = None
+            if style_distances is not None:
+                style_values = [float(style_distances[i, j]) for offset, i in enumerate(members)
+                                for j in members[offset + 1:] if j in adjacency[i]]
+                if not style_values:
+                    continue
+                style_support = round(float(np.quantile(style_values, .75)), 6)
+            entity_id = stable_id("entity_auto_", sorted(rows[i]["instance_id"] for i in members))
+            form_id = stable_id("form_auto_", entity_id, "default")
+            evidence = {
+                "policy": "multi_signal_identity_v1",
+                "primary_edge_max_distance": round(max(internal), 6),
+                "style_distance_q75": style_support,
+                "independent_panel_count": len(panels),
+                "representation_type": "live_character",
+                "corroborated_appearance_traits": corroborated_traits,
+                "source_visual_group_id": proposal.get("group_id"),
+            }
+            for index in members:
+                rows[index].update(
+                    entity_id=entity_id, form_id=form_id,
+                    identity_status="accepted_automatic",
+                    assignment_evidence=[evidence],
+                    decision_ids=[stable_id("decision_", entity_id, rows[index]["instance_id"], evidence)],
+                    appearance_count=len(panels),
+                )
+            accepted.append({
+                "entity_id": entity_id, "name": None,
+                "appearance_count": len(panels), "recurrence": "recurring",
+                "name_record": None, "naming_eligible": len(panels) >= 4,
+                "form_ids": [form_id],
+                "instance_ids": [rows[i]["instance_id"] for i in members],
+                "acceptance_policy": "multi_signal_identity_v1",
+                "acceptance_evidence": evidence,
+            })
+    result["identities"].extend(accepted)
+
+
+def _build_story_events(result: dict, descriptions: dict | None) -> list[dict]:
+    """Resolve labeled visible actions to exact current ReID instances."""
+    if not descriptions:
+        return []
+    characters = result.get("characters", [])
+    by_grounding = _grounding_index(characters)
+    events = []
+    for chapter, pages in descriptions.items():
+        if not isinstance(pages, dict):
+            continue
+        for page, data in pages.items():
+            if not isinstance(data, dict):
+                continue
+            matching = [row for row in characters
+                        if row.get("chapter") == chapter and Path(row.get("page", "")).name == page]
+            current = _current_description_page(data, matching)
+            for panel in data.get("panels", []):
+                panel_number = panel.get("panel_number")
+                for action in panel.get("actions", []):
+                    actor_detection = action.get("actor_detection_id")
+                    target_detection = action.get("target_detection_id")
+                    actor_candidates = [
+                        row for row in by_grounding.get(actor_detection, [])
+                        if row in matching and row.get("panel_number") == panel_number
+                    ] if current and actor_detection else []
+                    target_candidates = [
+                        row for row in by_grounding.get(target_detection, [])
+                        if row in matching and row.get("panel_number") == panel_number
+                    ] if current and target_detection else []
+                    event = {
+                        "event_id": stable_id(
+                            "story_event_", chapter, page, data.get("source_hash"),
+                            data.get("geometry_revision"), data.get("grounding_revision"),
+                            panel_number, action,
+                        ),
+                        "type": "visible_action",
+                        "chapter": chapter,
+                        "page": page,
+                        "panel_number": panel_number,
+                        "panel_id": actor_candidates[0].get("panel_id") if len(actor_candidates) == 1 else None,
+                        "text": action.get("text"),
+                        "actor_detection_id": actor_detection,
+                        "target_detection_id": target_detection,
+                        "status": "pending_review",
+                        "grounding_status": "current" if current else "stale_or_unverified",
+                    }
+                    reason = None
+                    if not current:
+                        reason = "stale_or_unverified_grounding"
+                    elif not actor_detection:
+                        reason = action.get("grounding_status") or "actor_detection_missing"
+                    elif len(actor_candidates) != 1:
+                        reason = "exact_actor_instance_required"
+                    elif target_detection and len(target_candidates) != 1:
+                        reason = "exact_target_instance_required"
+                    elif actor_candidates[0].get("narration_eligibility") not in {
+                        "eligible_automatic", "reviewed_eligible",
+                    }:
+                        reason = "actor_not_narration_eligible"
+                    elif target_candidates and target_candidates[0].get(
+                        "narration_eligibility"
+                    ) not in {"eligible_automatic", "reviewed_eligible"}:
+                        reason = "target_not_narration_eligible"
+                    elif action_issues(action.get("text", "")):
+                        reason = "invalid_action_phrase"
+                    elif (target_candidates
+                          and actor_candidates[0]["instance_id"] != target_candidates[0]["instance_id"]
+                          and actor_candidates[0].get("entity_id") is not None
+                          and actor_candidates[0].get("entity_id") == target_candidates[0].get("entity_id")):
+                        reason = "same_identity_occurrences_require_review"
+                    else:
+                        event.update(
+                            status="accepted_automatic",
+                            acceptance_policy="grounded_visible_action_format_v3",
+                            actor_instance_id=actor_candidates[0]["instance_id"],
+                            target_instance_id=(
+                                target_candidates[0]["instance_id"]
+                                if target_candidates else None
+                            ),
+                            actor_description=actor_candidates[0].get(
+                                "stable_description"
+                            ) or actor_candidates[0].get("visual_description"),
+                            target_description=(
+                                target_candidates[0].get("stable_description")
+                                or target_candidates[0].get("visual_description")
+                                if target_candidates else None
+                            ),
+                        )
+                    if reason:
+                        event["automatic_rejection_reason"] = reason
+                    events.append(event)
+    return events
+
+
+def _review_source_matches(review: dict, row: dict, prefix: str = "") -> bool:
+    fields = (
+        ((prefix + "page_hash", "page_hash"),
+         (prefix + "geometry_revision", "geometry_revision"),
+         (prefix + "grounding_revision", "grounding_revision"))
+        if prefix else
+        (("source_hash", "page_hash"),
+         ("geometry_revision", "geometry_revision"),
+         ("grounding_revision", "grounding_revision"))
+    )
+    return all(review.get(key) == row.get(row_key) for key, row_key in fields)
+
+
+def _apply_reviewed_events(result: dict, reviews: dict | None, events: list[dict],
+                           transformations: list[dict]) -> None:
+    """Import explicit current action/transformation endpoints from one sidecar."""
+    reviews = reviews or {}
+    by_id = {row["instance_id"]: row for row in result.get("characters", [])}
+    for review in reviews.get("reviewed_actions", []):
+        if not isinstance(review, dict) or review.get("status") != "accepted_reviewed":
+            raise ValueError("Reviewed action must be an accepted_reviewed object.")
+        actor = by_id.get(review.get("actor_instance_id"))
+        target = by_id.get(review.get("target_instance_id")) if review.get("target_instance_id") else None
+        text = review.get("text")
+        if (actor is None or not _review_source_matches(review, actor)
+                or actor.get("panel_id") != review.get("panel_id")
+                or not isinstance(text, str) or action_issues(text)):
+            raise ValueError("Reviewed action has stale or invalid actor evidence.")
+        if target is not None and (target.get("panel_id") != actor.get("panel_id")
+                                   or not _review_source_matches(review, target)):
+            raise ValueError("Reviewed action has stale target evidence.")
+        if actor.get("narration_eligibility") not in {"eligible_automatic", "reviewed_eligible"}:
+            raise ValueError("Reviewed action actor is not narration-eligible.")
+        if target is not None and target.get("narration_eligibility") not in {
+            "eligible_automatic", "reviewed_eligible",
+        }:
+            raise ValueError("Reviewed action target is not narration-eligible.")
+        events.append({
+            "event_id": review.get("fact_id") or stable_id("story_event_", review),
+            "type": "visible_action",
+            "chapter": actor.get("chapter"), "page": Path(actor.get("page", "")).name,
+            "panel_number": actor.get("panel_number"), "panel_id": actor.get("panel_id"),
+            "text": text.strip(), "status": "accepted_reviewed",
+            "acceptance_policy": "reviewed_visible_action_v1",
+            "actor_instance_id": actor["instance_id"],
+            "target_instance_id": target["instance_id"] if target else None,
+            "review_reason": review.get("reason"),
+        })
+
+    for review in reviews.get("reviewed_transformations", []):
+        if not isinstance(review, dict) or review.get("status") != "accepted_reviewed":
+            raise ValueError("Reviewed transformation must be accepted_reviewed.")
+        source = by_id.get(review.get("source_instance_id"))
+        target = by_id.get(review.get("target_instance_id"))
+        evidence = review.get("evidence")
+        if (review.get("type", "transformation") not in {
+                "transformation", "reversion", "disguise_reveal", "possession",
+                "summoning", "splitting", "fusion",
+            }
+                or source is None or target is None or source is target
+                or not _review_source_matches(review, source, "source_")
+                or not _review_source_matches(review, target, "target_")
+                or not isinstance(evidence, str) or not evidence.strip()):
+            raise ValueError("Reviewed transformation has stale or invalid endpoints.")
+        transformations.append({
+            "event_id": review.get("fact_id") or stable_id("transformation_", review),
+            "type": review.get("type", "transformation"),
+            "status": "accepted_reviewed",
+            "acceptance_policy": "reviewed_transformation_v1",
+            "accepted_instance_ids": [source["instance_id"], target["instance_id"]],
+            "source_panel_id": source.get("panel_id"),
+            "target_panel_id": target.get("panel_id"),
+            "source_page_hash": source.get("page_hash"),
+            "target_page_hash": target.get("page_hash"),
+            "source_geometry_revision": source.get("geometry_revision"),
+            "target_geometry_revision": target.get("geometry_revision"),
+            "source_grounding_revision": source.get("grounding_revision"),
+            "target_grounding_revision": target.get("grounding_revision"),
+            "evidence": evidence.strip(),
+        })
+
+
+def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transformations=None,
+                     descriptions=None):
     """Rebuild decisions using current reviews; never load any model here."""
     start = time.perf_counter()
     instances = deepcopy(prepared["instances"])
@@ -497,21 +1080,31 @@ def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transfor
     if transformations:
         if transformations.get("schema_version") != 1:
             raise ValueError("Unsupported transformation schema.")
-        for instance in instances:
-            data = transformations.get("chapters", {}).get(instance["chapter"], {}).get(Path(instance["page"]).name, {})
-            if (instance.get("page_role_source") in ("unknown", "description")
-                    and data.get("extraction_status") == "complete"
-                    and data.get("source_hash") == instance.get("page_hash")
-                    and data.get("geometry_revision") == instance.get("geometry_revision")):
-                role = data.get("page_role", "uncertain")
-                if role not in ("story", "reference", "extra", "uncertain"):
-                    role = "uncertain"
-                instance["page_role"] = role
-                flags = set(instance["quality_flags"]) - {"non_story_or_unknown_role"}
-                if role != "story":
-                    flags.add("non_story_or_unknown_role")
-                instance["quality_flags"] = sorted(flags)
-                instance["prototype_eligible"] = not flags
+    for instance in instances:
+        page_name = Path(instance["page"]).name
+        description_page = (descriptions or {}).get(instance["chapter"], {}).get(page_name, {})
+        transformation_page = (
+            (transformations or {}).get("chapters", {})
+            .get(instance["chapter"], {}).get(page_name, {})
+        )
+        data = (
+            description_page
+            if description_page.get("extraction_status") in {
+                "complete", "complete_with_uncertainty",
+            }
+            else transformation_page
+        )
+        if (instance.get("page_role_source") in ("unknown", "description")
+                and data.get("source_hash") == instance.get("page_hash")
+                and data.get("geometry_revision") == instance.get("geometry_revision")
+                and data.get("page_role") in ("story", "reference", "extra", "uncertain")):
+            role = data["page_role"]
+            instance["page_role"] = role
+            flags = set(instance["quality_flags"]) - {"non_story_or_unknown_role"}
+            if role != "story":
+                flags.add("non_story_or_unknown_role")
+            instance["quality_flags"] = sorted(flags)
+            instance["prototype_eligible"] = not flags
     resolver_kwargs = {
         "reviews": reviews,
         "group_threshold": prepared["group_threshold"],
@@ -531,30 +1124,122 @@ def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transfor
         )
     result["warnings"] = warnings + result["warnings"]
     assign_group_display_names(result, prepared["manga"])
+    _apply_grounded_descriptions(result, descriptions)
+    _apply_eligibility_reviews(result, reviews)
+    _classify_representation_types(result)
+    _promote_automatic_identities(
+        result,
+        distances,
+        proposal_threshold=prepared.get("group_threshold", .20),
+        strict_threshold=prepared.get("assignment_group_threshold", .14),
+        style_distances=prepared.get("style_distances"),
+    )
+    _apply_stable_descriptions(result)
+    story_events = _build_story_events(result, descriptions)
+    _apply_reviewed_events(result, reviews, story_events, events)
+    text_proposals = []
+    by_detection = {}
+    for character in result.get("characters", []):
+        for detection_id in character.get("grounding_ids", []) or []:
+            by_detection.setdefault(detection_id, []).append(character)
+    for chapter, pages in (descriptions or {}).items():
+        if not isinstance(pages, dict):
+            continue
+        for page_name, page in pages.items():
+            if not isinstance(page, dict):
+                continue
+            page_complete = page.get("extraction_status") in {
+                "complete", "complete_with_uncertainty",
+            }
+            for proposal in page.get("text_proposals", []):
+                if (not isinstance(proposal, dict)
+                        or proposal.get("status") != "pending_review"
+                        or not isinstance(proposal.get("panel_id"), str)):
+                    continue
+                exported = deepcopy(proposal)
+                exported.update(
+                    chapter=chapter,
+                    page=page_name,
+                    source_hash=page.get("source_hash"),
+                    geometry_revision=page.get("geometry_revision"),
+                    grounding_revision=page.get("grounding_revision"),
+                )
+                candidates = [
+                    row for row in by_detection.get(
+                        proposal.get("speaker_detection_id"), [],
+                    )
+                    if row.get("panel_id") == proposal.get("panel_id")
+                ]
+                exported["candidate_speaker_instance_id"] = (
+                    candidates[0]["instance_id"] if len(candidates) == 1 else None
+                )
+                reason = None
+                if not page_complete:
+                    reason = "incomplete_page_extraction"
+                elif proposal.get("kind") not in {
+                    "dialogue", "thought", "narration", "sign", "sound_effect", "publication",
+                }:
+                    reason = "invalid_text_kind"
+                elif text_issues(proposal.get("text", "")):
+                    reason = "invalid_or_incomplete_transcription"
+                elif (proposal.get("speaker_detection_id") is not None
+                      and len(candidates) != 1):
+                    reason = "exact_speaker_instance_required"
+                elif (candidates and candidates[0].get("narration_eligibility") not in {
+                    "eligible_automatic", "reviewed_eligible",
+                }):
+                    reason = "speaker_not_narration_eligible"
+                else:
+                    exported.update(
+                        status="accepted_automatic",
+                        acceptance_policy="grounded_text_transcription_format_v2",
+                        speaker_instance_id=exported["candidate_speaker_instance_id"],
+                        truth_status="transcribed_statement_only",
+                    )
+                if reason:
+                    exported["automatic_rejection_reason"] = reason
+                text_proposals.append(exported)
     if calibration is None:
         result["warnings"].append(
-            "No validated calibration: visual groups are proposals. Canonical identities require "
-            "review or a strictly accepted Qwen transformation."
+            "No validated calibration: broad visual groups remain proposals. Only recurrent "
+            "multi-signal live-character cores may be confirmed automatically; other occurrences "
+            "still require review or a strictly accepted Qwen transformation."
         )
-    result.update(schema_version=2, manga=prepared["manga"], encoder=prepared["encoder"],
+    result.update(schema_version=3, manga=prepared["manga"], encoder=prepared["encoder"],
                   encoder_fingerprint=prepared["encoder_fingerprint"], provider=prepared["provider"],
                   style_linker={"encoder": prepared.get("style_encoder"),
                                 "encoder_fingerprint": prepared.get("style_encoder_fingerprint"),
                                 "provider": prepared.get("style_provider"),
                                 "policy": "dual_encoder_anchor_v2" if prepared.get("style_distances") is not None else None},
-                  acceptance_policy={"rule_version": "resolver_v6",
+                    acceptance_policy={"rule_version": "resolver_v11_story_text_scope",
                                      "proposal_distance": prepared["group_threshold"],
                                      "assignment_group_distance": prepared.get("assignment_group_threshold", .14),
                                      "calibration": calibration,
-                                     "automatic_transformation": "qwen_direct_visible_change_v1"},
+                                      "automatic_transformation": "qwen_direct_visible_change_v1",
+                                        "grounded_story_event": "grounded_visible_action_format_v3",
+                                       "reviewed_story_event": "reviewed_visible_action_v1",
+                                       "automatic_text": "grounded_text_transcription_format_v2",
+                                       "automatic_identity": "multi_signal_identity_v1"},
                   input_chapters=prepared["chapters"], transformation_proposals=events,
+                   story_events=story_events, text_proposals=text_proposals,
+                  description_fingerprint=stable_id("descriptions_", descriptions),
+                  reviewed_evidence={
+                      key: deepcopy((reviews or {}).get(key, []))
+                      for key in (
+                          "panel_descriptions", "reviewed_text_facts",
+                          "reviewed_narration", "unresolved_critical_items",
+                      )
+                  },
                   elapsed_seconds=round(prepared["elapsed_seconds"] + time.perf_counter() - start, 3))
-    result["revision"] = stable_id("revision_", "resolver_v6", prepared["encoder_fingerprint"],
+    result["revision"] = stable_id("revision_", "resolver_v11_story_text_scope", prepared["encoder_fingerprint"],
                                    prepared["group_threshold"], reviews, calibration,
                                    prepared.get("assignment_group_threshold", .14),
                                    prepared.get("style_encoder_fingerprint"), result["style_links"],
-                                   events,
-                                   [(x["instance_id"], x["panel_id"], x["quality_flags"],
+                                    events,
+                                    story_events,
+                                    text_proposals,
+                                    result["description_fingerprint"],
+                                    [(x["instance_id"], x["panel_id"], x["quality_flags"],
                                              x["page_role"], x["reading_position"]) for x in instances],
                                    result["characters"], result["identities"], result["visual_groups"])
     return result
@@ -562,6 +1247,7 @@ def resolve_prepared(prepared: dict, *, reviews=None, calibration=None, transfor
 
 def classify_manga(manga_dir: Path, chapters: list[Path], output_dir: Path, *, encoder: Encoder,
                    cache_dir: Path, reviews=None, calibration=None, transformations=None,
+                   descriptions=None,
                    style_encoder: Encoder | None = None):
     """Return decisions without classification exports; reuse cached embeddings."""
     if calibration is not None:
@@ -576,5 +1262,5 @@ def classify_manga(manga_dir: Path, chapters: list[Path], output_dir: Path, *, e
         if style_encoder is not None and hasattr(style_encoder, "close"):
             style_encoder.close()
     result = resolve_prepared(prepared, reviews=reviews, calibration=calibration,
-                              transformations=transformations)
+                              transformations=transformations, descriptions=descriptions)
     return result, prepared["crops"], prepared["distances"]

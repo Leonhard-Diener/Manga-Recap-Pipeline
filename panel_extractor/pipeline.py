@@ -346,6 +346,10 @@ def detect_panels(
                 page_path=page_path,
                 boxes=ordered_boxes,
                 scores=ordered_scores,
+                text_boxes=sorted({
+                    tuple(int(round(float(value))) for value in detection.box)
+                    for detection in texts
+                }),
                 provisional=provisional,
                 preview_path=preview_path,
             )

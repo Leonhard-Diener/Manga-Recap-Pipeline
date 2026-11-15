@@ -94,12 +94,16 @@ There are two deliberately separate outputs:
   Single-crop groups are omitted. Their occurrence records have
   `visual_group_id: null` and remain listed in `ungrouped_instance_ids`.
 - `characters`: one record per detected occurrence. `entity_id: null` means
-  unknown. `identity_status` is `unknown`, `reviewed`, or `accepted_visual`.
+  unknown. `identity_status` includes `unknown`, `reviewed`, `accepted_visual`,
+  and `accepted_automatic`.
   Only accepted identities enter the manga-wide `identities` list.
 
-With no review file or validated calibration, the first run creates useful visual
-proposals but **zero confirmed identities**. This is expected, not evidence of
-measured classifier accuracy. A group must not be copied wholesale into narration.
+With no review file or validated calibration, broad visual groups remain proposals
+and are never copied wholesale into narration. A recurrent subset can now receive
+`accepted_automatic` only after representation typing removes toys/images/statues,
+at least three independent panels remain, grounded appearance traits agree, every
+member has two independent visual neighbours, and DINO plus CCIP agree when both
+encoders are available. Unsupported satellites remain unknown.
 The main gallery shows only groups with at least two crops. A separate
 `ungrouped.html` archive retains single observations for later evidence/review.
 
@@ -163,8 +167,7 @@ automatically: their chapter-local labels are unsafe as global identities.
 
 ## 4. Automatic propagation requires measured thresholds
 
-Without calibration, only explicitly reviewed crops receive canonical IDs.
-Automatic propagation additionally needs at least two clean reviewed references
+Calibration-based propagation additionally needs at least two clean reviewed references
 from distinct panels other than the query panel, agreement with all retained
 references in the chosen form, and a margin over competing candidates. Unreviewed
 lookalikes outside the query's proposal group also count as competitors. Automatic
@@ -222,19 +225,62 @@ the reveal position and delays naming for every occurrence of that entity/form.
 A stale reveal ID disables naming until corrected. This is separate from the
 name's own reveal position.
 
-`narration_allowed` remains false: this stage cannot prove that a particular
-visible character performed an action described in a panel. A later actor-grounding
-stage must check that before using proper names. Unknown identity also does not
-justify guessing gender; use a grounded descriptor, pronoun, or generic wording.
+Generic `narration_allowed` remains false because an ungrounded panel description
+does not prove which visible character acted. New panel runs also create a
+Qwen-only preview with request-local `C1`, `C2`, etc. labels. Qwen returns compact
+actions using those labels; ReID maps their durable detection IDs to exact
+instances and exports the result under `story_events`. Numerical model confidence
+is not requested or accepted as evidence. An action receives
+`status: accepted_automatic` and policy `grounded_visible_action_v1` only when
+its source revisions are current, actor/target resolve exactly in the same panel,
+both endpoints are narration-eligible, its phrase passes semantic validation,
+and the panel description independently contains the same visible action verb.
+Other proposals remain pending or explicitly ungrounded and are ignored by the
+writer. Optional source-bound records in `character_reviews.json.reviewed_actions`
+receive `status: accepted_reviewed` and policy `reviewed_visible_action_v1`. Unknown
+identity still does not justify guessing gender; use the grounded stable
+description or generic wording.
+
+The description stage also exports exact-text proposals. Structurally valid text
+from a complete, revision-bound page is accepted automatically under
+`grounded_text_transcription_v1`; an attributed speaker additionally requires one
+exact same-panel instance. The writer treats this as a transcription only, never
+as proof that a spoken claim is objectively true. Invalid or incompletely grounded
+records remain pending. A reviewed correction can still be supplied under
+`character_reviews.json.reviewed_text_facts`:
+
+```json
+{
+  "status": "accepted_reviewed",
+  "fact_id": "text_ch1_p3_panel2_1",
+  "panel_id": "panel_COPY_FROM_PROPOSAL",
+  "kind": "dialogue",
+  "text": "Exact wording checked against the page.",
+  "speaker_instance_id": null,
+  "truth_status": "statement_only",
+  "source_hash": "COPY_FROM_PROPOSAL",
+  "geometry_revision": "COPY_FROM_PROPOSAL",
+  "grounding_revision": "COPY_FROM_PROPOSAL"
+}
+```
+
+Allowed kinds are `dialogue`, `thought`, `narration`, `sign`, `sound_effect`, and
+`publication` (series/chapter titles, author credits and promotional copy).
+Publication text is retained for audit but omitted from story-generation input.
+Use the proposed `candidate_speaker_instance_id` only after
+visually checking the bubble tail; otherwise keep the speaker null. Changed page
+pixels, panel geometry, or grounding invalidate the reviewed fact rather than
+silently carrying dialogue into a different panel.
 
 ## 6. Transformation proposals from descriptions
 
 If the combined description JSON contains `transformations`, its successfully
-extracted events are attached as `transformation_proposals`, with source/target
-crop candidates based on panel numbers. A transformation, reversion, or disguise
+extracted events are attached as `transformation_proposals`. New runs resolve
+source/target `C` labels through durable detection IDs; legacy exports fall back
+to crop candidates based on panel numbers. A transformation, reversion, or disguise
 reveal can automatically connect two forms only when Qwen reports exactly 100%
 certainty and direct visible-change evidence, the panels are adjacent, hashes and
-geometry are current, each endpoint panel has exactly one high-quality instance,
+geometry are current, each labeled endpoint resolves to one high-quality instance,
 both are story panels, and no accepted identity or reviewed-different constraint
 conflicts. Accepted events use `status: accepted_automatic`; every failed gate
 keeps `status: pending_review` and records `automatic_rejection_reason`.
@@ -290,3 +336,35 @@ decisions without loading any model. The public API validates calibration metada
 just like the CLI. `main.py` remains outside this standalone identity workflow.
 
 Regression checks: `python -X utf8 -m unittest discover -s tests -v`.
+
+## 9. Story-evidence review extensions
+
+The existing manga-scoped `output/<manga>/character_reviews.json` is also the
+single lightweight story-evidence sidecar. Optional additive lists are:
+
+- `eligibility`: exact `instance_id`, source/geometry/grounding revisions,
+  `decision` (`eligible`, `uncertain`, or `rejected_non_character`), and reason;
+- `appearance_corrections`: exact current instance/revisions, a reviewed short
+  visible description, and `status: accepted_reviewed`;
+- `reviewed_actions`: exact panel/actor/optional target, current revisions,
+  visible action text, `fact_id`, and `status: accepted_reviewed`;
+- `reviewed_transformations`: explicit source and target instance/panel
+  endpoints with each endpoint's source hash and revisions, evidence, type,
+  `fact_id`, and `status: accepted_reviewed`; cross-page endpoints are allowed;
+- `panel_descriptions`, `reviewed_text_facts`, and `reviewed_narration`: exact
+  `panel_id`, current source/geometry/grounding revisions, `fact_id`, text, and
+  `status: accepted_reviewed`;
+- `unresolved_critical_items`: records with `status: unresolved`; any such
+  record blocks story publication.
+
+Reviewed text kinds are `narration`, `dialogue`, `thought`, `sign`, `sound_effect`,
+and `publication`. A speaker is optional, but when present must be a current,
+narration-eligible instance in that panel. Dialogue remains a statement unless
+its separately reviewed `truth_status` permits a stronger interpretation.
+
+Panel-stage geometry/order/role corrections live beside each chapter as
+`panel_review_corrections.json`. Each accepted entry is bound to `source_hash`
+and the detector's `base_geometry_revision`, supplies ordered boxes (or an
+explicit `reading_order`), and may supply a reviewed `page_role`. The detector
+panels remain in the manifest for audit, while corrected geometry creates new
+panel IDs/revisions and invalidates only affected downstream evidence.

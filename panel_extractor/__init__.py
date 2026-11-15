@@ -1,6 +1,6 @@
 """Public API for RT-DETRv4-X Manga panel extraction."""
 
-from .page_preview import save_page_preview
+from .page_preview import save_grounded_page_preview, save_page_preview
 from .pipeline import crop_panels, detect_panels, extract_panels
 from .splitter import SplitSettings, split_merged_panels
 from .types import PageDetection, PanelDetection
@@ -13,5 +13,6 @@ __all__ = [
     "detect_panels",
     "extract_panels",
     "save_page_preview",
+    "save_grounded_page_preview",
     "split_merged_panels",
 ]

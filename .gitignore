@@ -1,6 +1,7 @@
 input/*
 output/*
 .vscode/
+.env
 __pycache__/
 
 models/*
@@ -18,3 +19,5 @@ debug/*
 /_vlm_probe_*.log
 
 backup/*
+
+/old/

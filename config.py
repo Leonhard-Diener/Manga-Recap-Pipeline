@@ -12,6 +12,20 @@ PANEL_CONFIDENCE = 0.35
 TEXT_CONFIDENCE = 0.20
 BODY_CONFIDENCE = 0.20
 
+# Reliable character boxes exposed as C labels to Qwen and later ReID. Keep
+# BODY_CONFIDENCE low for the detector's internal panel/content processing;
+# boxes below this stricter threshold cannot support accepted story events.
+# Manga close-ups and cropped figures are often scored below .65 despite being
+# useful labels. .50 restores them while the duplicate and ambiguity filters
+# below still protect grounding quality.
+CHARACTER_LABEL_CONFIDENCE = 0.50
+CHARACTER_DUPLICATE_IOU = 0.75
+CHARACTER_DUPLICATE_CONTAINMENT = 0.90
+CHARACTER_DUPLICATE_MIN_AREA_RATIO = 0.40
+CHARACTER_DUPLICATE_ALIGNED_COVERAGE = 0.80
+CHARACTER_DUPLICATE_EDGE_TOLERANCE = 0.10
+CHARACTER_DUPLICATE_LARGER_SCORE_MARGIN = 0.08
+
 # Recover panels when full-page inference leaves too much of the page
 # unexplained.  A 20% gap can already be one complete panel, so tiles are used
 # before a large missing frame is silently accepted.  They are never recursive.
@@ -159,10 +173,10 @@ DOWNLOAD_ALL_CHAPTERS = True
 # individual test_*.py scripts instead.
 MANGA_TITLE = ""
 
-''' Qwen3.5-2B settings (steps 2 and 4) '''
-# Same local model, used both to classify pages (MANGA/EXTRA) and to
-# describe panels. Run download_model.py or place the model manually at
-# this path.
+''' Cloud description defaults (override OPENROUTER_MODEL in .env or --model) '''
+OPENROUTER_MODEL = "google/gemma-4-26b-a4b-it:free"
+
+''' Local description model (the story writer has its own GGUF model below) '''
 QWEN_MODEL_PATH = BASE_DIR / "models" / "Qwen3.5-2B"
 
 # Step 2: page classification (removal of credits/shoutouts/intros).
@@ -177,5 +191,27 @@ DESCRIPTION_MAX_PIXELS = 384 * 28 * 28
 # processing two pages together, not from truncating or regenerating answers.
 DESCRIPTION_MAX_NEW_TOKENS = 1024
 DESCRIPTION_BATCH_SIZE = 2
-DESCRIPTION_MAX_DESCRIPTION_CHARS = 100
+# The schema ceiling prevents runaway output, not prose length. A larger limit
+# lets Qwen finish a sentence; validation then enforces the shorter word limit
+# without exporting schema-clipped words or clauses.
+DESCRIPTION_MAX_DESCRIPTION_CHARS = 160
+DESCRIPTION_MAX_ACTION_CHARS = 120
 DESCRIPTION_ENABLE_THINKING = False
+
+# Story writer: text-only Qwen3.5-4B Q8 through a private llama.cpp server.
+STORY_MODEL_PATH = BASE_DIR / "models" / "Qwen3.5-4B-GGUF" / "Qwen3.5-4B-Q8_0.gguf"
+STORY_LLAMA_SERVER = BASE_DIR / "models" / "llama.cpp-b12292" / "llama-server.exe"
+STORY_NARRATION_WPM = 150
+STORY_SECONDS_PER_PANEL = 10
+STORY_SINGLE_REQUEST_TOKENS = 6_000
+STORY_CHUNK_TARGET_TOKENS = 4_500
+STORY_CHUNK_HARD_TOKENS = 6_000
+# Small local writers must not attempt a chapter-sized response before splitting.
+STORY_CHUNK_MAX_PANELS = 4
+STORY_CONTEXT_WORDS = 320
+STORY_ENABLE_THINKING = False
+# Input and generated output share the model context window.  Keep explicit
+# output/syntax headroom instead of treating the input limit as total capacity.
+STORY_CONTEXT_TOKEN_BUDGET = 8_192
+STORY_OUTPUT_HEADROOM_TOKENS = 512
+STORY_MAX_OUTPUT_TOKENS = 2_048

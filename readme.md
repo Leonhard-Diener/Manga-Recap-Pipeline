@@ -1,17 +1,21 @@
 # Manga Recap Pipeline
 
-Four steps, each runnable on its own or all together via `main.py`.
+The analysis stages are standalone. `old/main.py` is an archived legacy entry
+point, not the current workflow. Old backups and stale outputs are in `old/`;
+see `old/README.md` for the archive contents.
 
 1. **Download** (`downloader/`) — fetch chapters from MangaDex into
    `input/<manga title>/chapter_XXX/`.
-2. **Cleanup** (`cleanup/`) — a small VLM classifies each page as
-   `MANGA`/`EXTRA` and deletes the credits/shoutout/intro pages at the
-   start and end of every chapter. Only edge pages are touched.
-3. **Panels** (`panel_extractor/`) — RT-DETR detects panels, crops them,
+2. **Panels** (`panel_extractor/`) — RT-DETR detects panels, text, and bodies; crops panels,
    and writes numbered page previews (used later to know what each
    number refers to on the page).
-4. **Description** (`description/`) — the same VLM describes each
-   numbered panel on every page preview from step 3.
+3. **Description** (`description/`) — Qwen produces focused visual observations,
+   grounded action proposals, appearance descriptors, form-change proposals, and
+   pending exact-text transcriptions.
+4. **Character identity** (`story_entities/`) — ReID assigns stable instances,
+   visual groups, permitted names, grounded actions, and accepted form changes.
+5. **Story writer** (`story_writer/`) — text-only Qwen generation turns the
+   accepted evidence into a resumable panel-by-panel recap.
 
 ## Setup
 
@@ -20,29 +24,66 @@ pip install -r requirements.txt
 python download_model.py        # RT-DETR ONNX model -> models/model.onnx
 ```
 
-Place the Qwen3.5-2B model at `models/Qwen3.5-2B` (used for steps 2 and 4).
-
-## Run everything
-
-```bash
-python main.py "Manga title"
-python main.py "Manga title" --no-all-chapters   # only the first chapter
-```
-
-Each step's model is loaded once and reused across all chapters before
-moving to the next step.
+Place the Qwen3.5-2B model at `models/Qwen3.5-2B` (used for description and writing).
 
 ## Run one step at a time
 
 ```bash
-python test_download.py "Manga title"      # step 1
-python test_cleanup.py "Manga title"       # step 2 — deletes extra pages!
-python test_panels.py "Manga title"        # step 3
-python test_description.py "Manga title"   # step 4
+python test_download.py "Manga title"      # optional source download
+python test_panels.py "Manga title"
+python test_description.py "Manga title"
+python -X utf8 test_character_reid.py "Manga title"
+python test_write_storry.py "Manga title"
 ```
 
 The title argument is optional if `config.MANGA_TITLE` is set, or if
 `input/` already contains exactly one manga folder.
+
+## Cloud descriptions: change models in one place
+
+Use `test_description_openrouter.py` instead of the local description runner.
+Copy `.env.example` to `.env` if needed, insert your OpenRouter key, and change
+only this line whenever you want a different model:
+
+```dotenv
+OPENROUTER_MODEL=google/gemma-4-26b-a4b-it:free
+```
+
+A full link such as
+`https://openrouter.ai/google/gemma-4-26b-a4b-it:free?view=api` also works.
+
+```powershell
+python test_description_openrouter.py "Manga title"
+# Optional override for just this run:
+python test_description_openrouter.py --model "https://openrouter.ai/google/gemma-4-26b-a4b-it:free?view=api"
+```
+
+The client automatically checks image support and chooses a compatible JSON
+format from endpoint metadata once per run, without generating model output.
+Local JSON validation and one format-only repair remain active. It never changes
+your chosen model or switches a free model to a paid one. CLI options override
+environment variables, which override `.env`, then defaults in `config.py`.
+If an old shell-level `OPENROUTER_MODEL` is set, remove it to use `.env`.
+Local Qwen settings are unaffected.
+
+Advanced: compatible custom APIs without model metadata can use
+`--response-format json_schema`, `json_object`, or `text` instead of `auto`.
+
+For a native Google AI Studio run, put the key in `.env` and use the separate
+Google runner:
+
+```dotenv
+GEMINI_API_KEY=YOUR_GOOGLE_AI_STUDIO_KEY
+GOOGLE_MODEL=gemini-3.5-flash-lite
+GOOGLE_MEDIA_RESOLUTION=high
+```
+
+```powershell
+python -X utf8 test_description_google.py "Manga title"
+```
+
+Google runs use their own resumable chapter checkpoint. They publish the same
+description JSON contract as the local and OpenRouter runners.
 
 ## Output layout
 
@@ -50,16 +91,27 @@ The title argument is optional if `config.MANGA_TITLE` is set, or if
 output/<manga title>/<chapter>/
     panel_0001.jpg ...            # step 3 crops
     page_previews/<page>.jpg      # step 3 numbered previews
+    grounded_page_previews/<page>.jpg  # panel numbers + request-local C labels
 output/<manga title>_descriptions.json   # descriptions + transformations
+output/<manga title>/character_classification.json
+output/<manga title>_story.txt
+output/<manga title>_story.json
+output/<manga title>_panel_timeline.json
 ```
 
-`test_description.py` writes one combined file from the Qwen page-generation pass.
+`test_description.py` writes one combined file from focused Qwen passes.
 Its `transformations` section contains proposed transformations, reversions, disguise reveals,
 possession, summoning, splitting, and fusion events, grouped by chapter and page.
-Events include source/target panel numbers, visual descriptions, and evidence;
+Events include source/target panel numbers, exact local character labels, visual descriptions, and evidence;
 they begin as `pending_review`. During ReID, only 100%-certain direct visible
-changes with unique, current, high-quality adjacent-panel endpoints can connect
-separate forms under one entity. All other events remain pending.
+changes with current, high-quality labeled adjacent-panel endpoints can connect
+separate forms under one entity. Legacy unlabeled events still require one unique
+character in each endpoint panel. All other events remain pending.
+Grounded panel actions use the same labels. ReID expands them to stable instance,
+entity, form, display-name, and stable-description fields in `story_events`.
+Clearly readable dialogue, thoughts, narration, signs, and sound effects are kept
+as `pending_review` transcription proposals. They reach the writer only after a
+source- and revision-bound review; model transcription alone is never a story fact.
 Each result still interprets one page independently, so cross-page transitions
 are not inferred. Invalid or truncated responses are flagged separately from
 successful pages containing no events.
@@ -95,6 +147,26 @@ for review files, transformations, display-name behavior, current limitations, a
 reusable Python return API.
 The standalone runner also saves a manga-scoped SQLite revision history and
 source-linked review galleries. This workflow does not require running `main.py`.
+
+## Story writer
+
+Run `test_write_storry.py` after the panel, description, and character-ReID
+stages. It rejects stale hashes and old exports that do not contain grounded
+actions. It sends only accepted actions and accepted transformations to Qwen,
+uses the per-instance permitted name or stable visual reference, and validates
+the returned panel order, support IDs, instance IDs, name uses, and approximate
+segment length.
+
+Progress is written after every successful chunk and automatically resumes when
+the inputs and settings still match. `--restart` archives compatible progress
+and starts a new run. Raw responses from both allowed attempts are retained in
+`output/<manga title>/story_runs/<run id>/`; a chunk that is still invalid after
+one correction retry stops without publishing a partial final story.
+
+For fidelity, the whole-story outline is assembled from existing descriptions
+instead of asking the model to invent a summary. The final boundary pass only
+removes an exactly duplicated sentence across adjacent chunks; it does not
+rewrite accepted story facts.
 
 ## Debug colors (panel previews)
 

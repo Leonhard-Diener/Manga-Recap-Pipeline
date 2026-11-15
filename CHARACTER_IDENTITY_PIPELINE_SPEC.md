@@ -242,7 +242,8 @@ For each target page, supply:
 - Relevant previous-page boundary panels when needed for continuity.
 - Optional OCR boxes/text, with uncertainty and source identifiers.
 
-For the initial implementation, use a bounded previous-page overlap so a
+The current implementation grounds one page at a time. A later extension can use
+a bounded previous-page overlap so a
 transformation beginning on one page and ending on the next is visible in one
 request. Emit new action records only for the target page; context panels may be
 referenced as evidence. This prevents duplicated descriptions and counts.
@@ -336,10 +337,11 @@ and whether referenced instances belong to the supplied images. Valid JSON does
 not prove that the model chose the right actor. Ambiguous localization must leave
 the actor unassigned or require review before named narration.
 
-The current 48-token whole-page output limit is unsuitable for this schema.
-Choose a bounded output budget based on panel and candidate count, measured on
-representative pages. Detect output truncation; never treat a cut-off result as a
-complete page or manufacture missing records.
+The implementation keeps the normal 1,024-token ceiling and raises it
+dynamically, up to 2,048, only for dense grounded pages based on panel and
+candidate count. EOS still ends ordinary responses early. It detects output
+truncation and never treats a cut-off result as a complete page or manufactures
+missing records.
 
 Keep thinking disabled initially, consistent with the current runtime goal.
 Schema-constrained decoding can help if the chosen runtime supports it; always
@@ -348,6 +350,22 @@ design. If it fails, save raw output and mark the affected fields unavailable.
 Only independently validated records may proceed.
 
 Do not assume an invalid structured response contains a usable description.
+
+### Implemented local-label bridge
+
+The panel stage now reuses the body detections from its existing RT-DETR pass,
+assigns deterministic page-local `C` labels, saves durable detection IDs, and
+writes a separate grounded preview. The clean numbered preview remains intact.
+The description response maps labels to detection IDs immediately; ReID then
+preserves those IDs as aliases when detector proposals overlap.
+
+Grounded appearance phrases attach to exact instances and provide one stable
+description per retained visual group. Grounded visible actions are exported as
+`story_events`. They become `accepted_automatic` only with current source and
+geometry hashes, 100% reported certainty, exact high-quality actor/target
+mapping, and story-page endpoints. A valid label proves localization, not that
+the model's semantic interpretation is infallible, so failed gates remain
+pending and keep an explicit rejection reason.
 Missing descriptions should be flagged for review or omitted from export, not
 invented by a fallback template.
 

@@ -122,6 +122,10 @@ def publish_result(result, crops, destination: Path, chapters, *, reviews, calib
     write_json(run_dir / CLASSIFICATION_FILE_NAME, result)
     write_json(run_dir / "review_template.json", {
         "schema_version": 1, "assignments": [], "different": [], "names": [],
+        "reviewed_text_facts": [],
+        # Convenience-only proposals: the writer ignores these until a reviewer
+        # creates a revision-bound accepted_reviewed fact above.
+        "text_proposals": result.get("text_proposals", []),
     })
     output_file = destination / CLASSIFICATION_FILE_NAME
     if output_file.is_file():
@@ -134,6 +138,10 @@ def publish_result(result, crops, destination: Path, chapters, *, reviews, calib
         chapter_result = {k: v for k, v in result.items() if k not in ("characters", "visual_groups")}
         chapter_result["chapter"] = chapter.name
         chapter_result["characters"] = [r for r in result["characters"] if r["chapter"] == chapter.name]
+        chapter_result["story_events"] = [
+            event for event in result.get("story_events", [])
+            if event.get("chapter") == chapter.name
+        ]
         write_json(chapter_file, chapter_result)
     for warning in result["warnings"]:
         print("WARNING:", warning)

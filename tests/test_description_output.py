@@ -17,7 +17,11 @@ from description.describer import (
     describe_pages,
 )
 from description.response import EVENT_TYPES, parse_page_response
-from description.schema import page_response_schema
+from description.schema import (
+    page_response_schema,
+    panel_observation_schema,
+    text_evidence_schema,
+)
 
 
 def response_payload():
@@ -50,6 +54,50 @@ class ResponseTests(unittest.TestCase):
         number = schema["properties"]["p"]["items"]["properties"]["n"]
         self.assertEqual(number["enum"], [1, 2])
         self.assertIn("c", schema["properties"]["e"]["items"]["required"])
+
+    def test_grounded_schema_requires_descriptors_actions_and_event_endpoints(self):
+        schema = page_response_schema([1, 2], [])
+        self.assertEqual(schema["required"], ["r", "p", "e", "c"])
+        self.assertIn("a", schema["properties"]["p"]["items"]["required"])
+        event_required = schema["properties"]["e"]["items"]["required"]
+        self.assertIn("si", event_required)
+        self.assertIn("ti", event_required)
+        self.assertEqual(schema["properties"]["c"]["properties"], {})
+        self.assertEqual(schema["properties"]["c"]["required"], [])
+        actor = schema["properties"]["p"]["items"]["properties"]["a"]["items"]["properties"]["s"]
+        self.assertEqual(actor["anyOf"][0], {"type": "string", "enum": []})
+
+    def test_grounded_schema_allows_only_the_exact_supplied_labels(self):
+        labels = [{"label": "C2"}, {"label": "C1"}]
+        schema = page_response_schema([1], labels)
+        characters = schema["properties"]["c"]
+        self.assertEqual(characters["required"], ["C1", "C2"])
+        self.assertEqual(set(characters["properties"]), {"C1", "C2"})
+        self.assertFalse(characters["additionalProperties"])
+        self.assertEqual(characters["properties"]["C1"]["required"], ["d", "r"])
+        self.assertIn("toy", characters["properties"]["C1"]["properties"]["r"]["enum"])
+        action_actor = schema["properties"]["p"]["items"]["properties"]["a"]["items"]["properties"]["s"]
+        self.assertEqual(action_actor["anyOf"][0]["enum"], ["C1", "C2"])
+
+    def test_focused_observation_schema_has_no_model_confidence(self):
+        labels = [{"label": "C2"}, {"label": "C1"}]
+        schema = panel_observation_schema([2, 1], labels)
+        self.assertEqual(schema["required"], ["p"])
+        panel = schema["properties"]["p"]["items"]
+        self.assertEqual(panel["required"], ["n", "d", "a"])
+        action = panel["properties"]["a"]["items"]
+        self.assertEqual(action["properties"]["s"]["anyOf"][0]["enum"], ["C1", "C2"])
+        self.assertEqual(action["properties"]["s"]["anyOf"][1], {"type": "null"})
+        self.assertNotIn("c", action["properties"])
+        self.assertEqual(action["required"], ["s", "t", "x"])
+
+    def test_text_schema_keeps_transcriptions_panel_linked_and_unaccepted(self):
+        schema = text_evidence_schema([1, 2], [{"label": "C1"}])
+        panel = schema["properties"]["p"]["items"]
+        self.assertEqual(panel["required"], ["n", "t"])
+        text = panel["properties"]["t"]["items"]
+        self.assertIn("dialogue", text["properties"]["k"]["enum"])
+        self.assertEqual(text["properties"]["s"]["anyOf"][0]["enum"], ["C1"])
 
     def test_prompt_has_no_fictional_values_for_model_to_copy(self):
         self.assertNotIn("horned woman", PAGE_PROMPT.lower())
@@ -117,6 +165,53 @@ class ResponseTests(unittest.TestCase):
         self.assertEqual(result["panels"][0]["panel_number"], 1)
         self.assertEqual(result["events"][0]["source_description"], "horned figure")
 
+    def test_grounded_response_expands_labels_to_detection_ids(self):
+        labels = [
+            {"label": "C1", "detection_id": "det_one", "panel_number": 1},
+            {"label": "C2", "detection_id": "det_two", "panel_number": 2},
+        ]
+        payload = {
+            "r": "story",
+            "p": [
+                {"n": 1, "d": "A horned figure raises a hand.",
+                 "a": [{"s": "C1", "t": None, "x": "raises a hand", "c": 100}]},
+                {"n": 2, "d": "A winged figure lands nearby.", "a": []},
+            ],
+            "e": [{"t": "transformation", "sp": 1, "tp": 2,
+                   "sd": "horned figure", "td": "winged figure",
+                   "x": "wings visibly emerge", "xt": "visible_change", "c": 100,
+                   "si": "C1", "ti": "C2"}],
+            "c": {
+                "C1": {"d": "horned dark-haired figure", "r": "live_character"},
+                "C2": {"d": "small winged figurine", "r": "toy"},
+            },
+        }
+        result = parse_page_response(
+            json.dumps(payload), expected_panels=[1, 2], character_labels=labels,
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["panels"][0]["actions"][0]["actor_detection_id"], "det_one")
+        self.assertEqual(result["characters"][1]["detection_id"], "det_two")
+        self.assertEqual(result["characters"][1]["representation_type"], "toy")
+        self.assertEqual(result["events"][0]["target_detection_id"], "det_two")
+
+    def test_grounded_action_cannot_reference_label_from_another_panel(self):
+        labels = [{"label": "C1", "detection_id": "det_one", "panel_number": 2}]
+        payload = {
+            "r": "story",
+            "p": [{"n": 1, "d": "A figure waves.",
+                   "a": [{"s": "C1", "t": None, "x": "waves", "c": 100}]},
+                  {"n": 2, "d": "The figure stands nearby.", "a": []}],
+            "e": [],
+            "c": [{"i": "C1", "v": "dark-haired figure"}],
+        }
+        result = parse_page_response(
+            json.dumps(payload), expected_panels=[1, 2], character_labels=labels,
+        )
+        self.assertEqual(result["status"], "complete")
+        self.assertEqual(result["panels"][0]["actions"], [])
+        self.assertTrue(result["grounding_errors"])
+
     def test_wrong_references_and_event_fields_fail_closed(self):
         for key, value in (
             ("source_panel", 99), ("source_panel", True), ("target_panel", "2"),
@@ -146,7 +241,7 @@ class ResponseTests(unittest.TestCase):
                 result = parse_page_response(json.dumps(payload))
                 self.assertEqual(result["events"][0]["type"], event_type)
 
-    def test_descriptions_remove_labels_quotes_and_dangling_clauses(self):
+    def test_descriptions_preserve_labels_quotes_and_dangling_clauses(self):
         payload = response_payload()
         payload["panels"] = [{
             "panel_number": 1,
@@ -159,8 +254,17 @@ class ResponseTests(unittest.TestCase):
         result = parse_page_response(json.dumps(payload), expected_panels=[1])
         self.assertEqual(
             result["panels"][0]["description"],
-            "A winged girl flies through the air.",
+            payload["panels"][0]["description"],
         )
+
+    def test_text_only_description_is_preserved(self):
+        payload = {
+            "r": "uncertain", "p": [{"n": 1, "d": "'RUN AWAY!'"}], "e": [],
+        }
+        result = parse_page_response(json.dumps(payload), expected_panels=[1])
+        self.assertEqual(result["panels"][0]["description"], "'RUN AWAY!'")
+        self.assertEqual(result["panels"][0]["status"], "usable")
+        self.assertNotEqual(result["panels"][0]["description"], "Visible manga scene.")
 
 
 class ReturnAndExportTests(unittest.TestCase):
@@ -212,6 +316,45 @@ class ReturnAndExportTests(unittest.TestCase):
         self.assertTrue(all(result["generation_attempts"] == 1 for result in results))
         self.assertTrue(all(result["token_limit"] == 1024 for result in results))
         self.assertTrue(all(result["status"] == "complete" for result in results))
+
+    def test_grounded_batch_builds_one_exact_label_filter_per_page(self):
+        processor, model = MagicMock(), MagicMock()
+        input_ids = MagicMock()
+        input_ids.shape = (2, 50)
+        processor.apply_chat_template.return_value = {"input_ids": input_ids}
+        first_labels = [{"label": "C1", "detection_id": "det_1", "panel_number": 1}]
+        second_labels = [
+            {"label": "C1", "detection_id": "det_2", "panel_number": 1},
+            {"label": "C2", "detection_id": "det_3", "panel_number": 1},
+        ]
+        processor.decode.side_effect = [
+            json.dumps({"r": "story", "p": [{"n": 1, "d": "One figure stands.", "a": []}],
+                        "e": [], "c": [{"i": "C1", "v": "dark-haired figure"}]}),
+            json.dumps({"r": "story", "p": [{"n": 1, "d": "Two figures stand.", "a": []}],
+                        "e": [], "c": [{"i": "C1", "v": "dark-haired figure"},
+                                         {"i": "C2", "v": "light-haired figure"}]}),
+        ]
+        generated = MagicMock()
+        generated.shape = (200,)
+        output = MagicMock()
+        output.__getitem__.side_effect = [generated, generated]
+        model.generate.return_value = output
+
+        with patch.dict("sys.modules", {"torch": MagicMock()}), \
+                patch("description.describer.build_prefix_allowed_tokens_fn",
+                      side_effect=[MagicMock(), MagicMock()]) as build, \
+                patch("description.describer.move_to_device", side_effect=lambda data, device: data):
+            results = describe_pages(
+                [(Path("first.jpg"), [1], first_labels),
+                 (Path("second.jpg"), [1], second_labels)],
+                processor,
+                model,
+            )
+
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(build.call_args_list[0].args[2], first_labels)
+        self.assertEqual(build.call_args_list[1].args[2], second_labels)
+        self.assertTrue(all(not result["grounding_errors"] for result in results))
 
     def test_chapter_collects_both_outputs_from_one_batched_call(self):
         page = parse_page_response(json.dumps(response_payload()))
@@ -293,7 +436,74 @@ class ReturnAndExportTests(unittest.TestCase):
 
         self.assertEqual([len(call.args[0]) for call in batched.call_args_list], [1, 2, 1])
 
-    def test_manga_loads_once_returns_both_and_writes_nothing(self):
+    def test_current_manifest_uses_focused_passes_without_legacy_generation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chapter = Path(directory) / "chapter_001"
+            previews = chapter / "page_previews"
+            grounded = chapter / "grounded_page_previews"
+            previews.mkdir(parents=True)
+            grounded.mkdir()
+            source = chapter / "source.jpg"
+            preview = previews / "source.jpg"
+            grounded_preview = grounded / "source.jpg"
+            for path in (source, preview, grounded_preview):
+                path.write_bytes(b"image")
+            manifest = {
+                "schema_version": 2,
+                "pages": [{
+                    "page": str(source), "source_hash": "hash", "page_order": 0,
+                    "page_id": "page", "geometry_revision": "geometry",
+                    "grounding_revision": "grounding",
+                    "grounded_preview": str(grounded_preview),
+                    "grounded_preview_hash": "hash",
+                    "panels": [{"panel_number": 1, "panel_id": "panel", "box": [0, 0, 10, 10]}],
+                    "character_labels": [], "text_regions": [[1, 1, 5, 5]],
+                }],
+            }
+            (chapter / "panel_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            observation = {
+                "payload": {"p": [{"n": 1, "d": "A person raises one hand.", "a": []}]},
+                "raw_response": "observation", "status": "complete",
+                "generation_time": 2.0, "generated_tokens": 20, "token_limit": 128,
+            }
+            text = {
+                "payload": {"p": [{"n": 1, "t": [{
+                    "k": "narration", "x": "Three days earlier", "s": None,
+                }]}]}, "raw_response": "text",
+                "status": "complete", "generation_time": 0.5,
+                "generated_tokens": 5, "token_limit": 128,
+            }
+            with patch("description.describer.file_hash", return_value="hash"), \
+                    patch("description.describer.classify_pages", return_value=[{
+                        "page_role": "story", "raw_response": "story", "generation_time": 0.1,
+                        "generated_tokens": 1,
+                    }]), \
+                    patch("description.describer.describe_focused_pages",
+                          side_effect=[[observation], [text]]) as focused, \
+                    patch("description.describer.describe_pages",
+                          side_effect=AssertionError("legacy pass must not run")):
+                result = describe_chapter(chapter, object(), object(), filter_non_story=True)
+
+            self.assertEqual([call.kwargs["task"] for call in focused.call_args_list], [
+                "observation", "text",
+            ])
+            observation_path = focused.call_args_list[0].args[0][0][0]
+            text_path = focused.call_args_list[1].args[0][0][0]
+            self.assertEqual(observation_path, grounded_preview)
+            self.assertEqual(text_path, grounded_preview)
+            self.assertEqual(
+                focused.call_args_list[1].args[0][0][3]["text_region_count"], 1,
+            )
+            exported = result["descriptions"]["source.jpg"]
+            self.assertEqual(exported["panels"][0]["description"], "A person raises one hand.")
+            self.assertIn("observation", exported["task_metrics"])
+            self.assertNotIn("combined_legacy", exported["task_metrics"])
+            self.assertEqual(result["transformations"]["source.jpg"]["raw_response"], "")
+            self.assertEqual(exported["text_proposals"][0]["text"], "Three days earlier")
+            self.assertEqual(exported["text_proposals"][0]["status"], "pending_review")
+            self.assertEqual(exported["task_metrics"]["text"]["retry_count"], 0)
+
+    def test_manga_loads_once_and_reuses_atomic_chapter_checkpoints(self):
         model = MagicMock()
         model.parameters.return_value = iter([MagicMock(dtype="float16")])
         chapter_result = {
@@ -302,12 +512,27 @@ class ReturnAndExportTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory)
+            chapters = [Path("chapter_001"), Path("chapter_002")]
+            for chapter in chapters:
+                chapter_output = output / chapter.name
+                chapter_output.mkdir(parents=True)
+                (chapter_output / "panel_manifest.json").write_text(
+                    json.dumps({"schema_version": 2, "pages": []}), encoding="utf-8"
+                )
             with patch.dict("sys.modules", {"torch": MagicMock()}), \
                     patch("description.describer.load_describer", return_value=(object(), model)) as load, \
-                    patch("description.describer.describe_chapter", return_value=chapter_result):
-                result = describe_manga(output, [Path("chapter_001"), Path("chapter_002")])
+                    patch("description.describer.describe_chapter", return_value=chapter_result) as describe:
+                result = describe_manga(output, chapters)
             load.assert_called_once()
-            self.assertEqual(list(output.iterdir()), [])
+            self.assertEqual(describe.call_count, 2)
+            self.assertTrue(all(
+                (output / chapter.name / "description_checkpoint.json").is_file()
+                for chapter in chapters
+            ))
+            with patch("description.describer.load_describer", side_effect=AssertionError("cached")), \
+                    patch("description.describer.describe_chapter", side_effect=AssertionError("cached")):
+                resumed = describe_manga(output, chapters)
+            self.assertEqual(resumed, result)
             self.assertEqual(set(result["descriptions"]), {"chapter_001", "chapter_002"})
             self.assertEqual(set(result["transformations"]["chapters"]), {"chapter_001", "chapter_002"})
             self.assertNotIn("page_filter", result)

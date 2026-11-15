@@ -1,0 +1,21 @@
+{
+  "chapter_001": {
+    "00002": {"expected_role": "story", "forbid_text_copy": true},
+    "00003": {"expected_role": "extra", "forbid_text_copy": true},
+    "00004": {"expected_role": "story", "forbid_text_copy": true},
+    "00005": {"expected_role": "story", "forbid_text_copy": true}
+  },
+  "chapter_002": {
+    "00001": {"expected_role": "story", "forbid_text_copy": true},
+    "00007": {"expected_role": "story", "forbid_text_copy": true},
+    "00012": {"expected_role": "story", "forbid_text_copy": true},
+    "00018": {
+      "expected_role": "story",
+      "forbid_text_copy": true,
+      "require_unique_panel_descriptions": true,
+      "minimum_grounded_action_rate": 0.5
+    },
+    "00022": {"expected_role": "story", "forbid_text_copy": true},
+    "00024": {"expected_role": "story", "forbid_text_copy": true}
+  }
+}

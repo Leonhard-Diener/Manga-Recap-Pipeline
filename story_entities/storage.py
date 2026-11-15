@@ -63,6 +63,8 @@ def save_revision(database: Path, result: dict, reviews: dict, *, run_id: str, m
                 record("visual_group", row["group_id"], row)
             for row in result["transformation_proposals"]:
                 record("claim", row["event_id"], row)
+            for row in result.get("story_events", []):
+                record("story_event", row["event_id"], row)
             for manifest in manifests:
                 for page in manifest.get("pages", []):
                     identity = page.get("page_id") or stable_id("page_", page["page"], page.get("source_hash"))

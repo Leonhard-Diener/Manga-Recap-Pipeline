@@ -30,6 +30,9 @@ _LABEL_BG = (148, 0, 211)           # vivid purple — visible on any manga page
 _LABEL_FG = (255, 255, 255)         # white text
 _LABEL_PAD = 10                     # pixels of padding inside the badge
 _FONT_SIZE = 36                     # points for the panel number
+_CHARACTER_BORDER_COLOR = (0, 190, 255)
+_CHARACTER_LABEL_BG = (210, 45, 20)
+_CHARACTER_BORDER_WIDTH = 3
 
 
 # ── reading-order sort ────────────────────────────────────────────────────────
@@ -268,6 +271,33 @@ def _draw_badge(
         draw.text((bx1 + _LABEL_PAD, by1 + _LABEL_PAD), label, fill=_LABEL_FG, font=font)
 
 
+def _draw_character_badge(
+    draw: ImageDraw.ImageDraw,
+    label: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    x: int,
+    y: int,
+    img_w: int,
+    img_h: int,
+) -> None:
+    """Draw a compact C-label without changing the established panel badges."""
+    try:
+        bounds = font.getbbox(label)
+        text_w, text_h = bounds[2] - bounds[0], bounds[3] - bounds[1]
+    except AttributeError:
+        text_w, text_h = draw.textsize(label, font=font)  # type: ignore[attr-defined]
+    pad = max(4, _LABEL_PAD // 2)
+    width, height = text_w + pad * 2, text_h + pad * 2
+    x = max(0, min(x, img_w - width))
+    y = max(0, min(y, img_h - height))
+    draw.rectangle((x, y, x + width, y + height), fill=_CHARACTER_LABEL_BG)
+    try:
+        draw.text((x + width // 2, y + height // 2), label,
+                  fill=_LABEL_FG, font=font, anchor="mm")
+    except TypeError:
+        draw.text((x + pad, y + pad), label, fill=_LABEL_FG, font=font)
+
+
 # ── public API ────────────────────────────────────────────────────────────────
 
 def save_page_preview(
@@ -277,6 +307,7 @@ def save_page_preview(
     output_dir: Path,
     *,
     jpeg_quality: int = 92,
+    preserve_order: bool = False,
 ) -> Path:
     """Draw numbered panel borders on *image* and save the result.
 
@@ -310,7 +341,7 @@ def save_page_preview(
     img_w, img_h = annotated.size
 
     # Sort boxes into manga reading order.
-    order = _manga_reading_order(final_boxes)
+    order = list(range(len(final_boxes))) if preserve_order else _manga_reading_order(final_boxes)
 
     for reading_number, box_index in enumerate(order, start=1):
         box = final_boxes[box_index]
@@ -328,6 +359,52 @@ def save_page_preview(
         py = y1 + inset
 
         _draw_badge(draw, str(reading_number), font, px, py, img_w, img_h)
+
+    out_path = preview_dir / page_path.name
+    annotated.save(out_path, format="JPEG", quality=jpeg_quality)
+    return out_path
+
+
+def save_grounded_page_preview(
+    image: Image.Image,
+    final_boxes: list[np.ndarray],
+    characters: list[dict],
+    page_path: Path,
+    output_dir: Path,
+    *,
+    jpeg_quality: int = 92,
+    preserve_order: bool = False,
+) -> Path:
+    """Save a Qwen-only preview with panel numbers and local C labels."""
+    preview_dir = output_dir / "grounded_page_previews"
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    annotated = image.copy()
+    draw = ImageDraw.Draw(annotated)
+    panel_font = _load_font(_FONT_SIZE)
+    character_font = _load_font(max(24, min(38, annotated.width // 38)))
+    img_w, img_h = annotated.size
+
+    order = list(range(len(final_boxes))) if preserve_order else _manga_reading_order(final_boxes)
+    for reading_number, box_index in enumerate(order, start=1):
+        x1, y1, x2, y2 = [int(round(float(value))) for value in final_boxes[box_index]]
+        draw.rectangle((x1, y1, x2, y2), outline=_BORDER_COLOR, width=_BORDER_WIDTH)
+        inset = _BORDER_WIDTH + 4
+        _draw_badge(draw, str(reading_number), panel_font,
+                    x1 + inset, y1 + inset, img_w, img_h)
+
+    for character in characters:
+        box = character.get("box")
+        label = character.get("label")
+        if not isinstance(box, list) or len(box) != 4 or not isinstance(label, str):
+            continue
+        x1, y1, x2, y2 = [int(round(float(value))) for value in box]
+        draw.rectangle((x1, y1, x2, y2), outline=_CHARACTER_BORDER_COLOR,
+                       width=_CHARACTER_BORDER_WIDTH)
+        # Prefer just above the body box. Falling back to its upper edge keeps
+        # the label visible when the character touches the top of the page.
+        badge_y = y1 - max(34, annotated.width // 45)
+        _draw_character_badge(draw, label, character_font, x1, badge_y,
+                              img_w, img_h)
 
     out_path = preview_dir / page_path.name
     annotated.save(out_path, format="JPEG", quality=jpeg_quality)

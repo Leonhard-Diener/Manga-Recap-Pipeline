@@ -38,6 +38,7 @@ class PageDetection:
     page_path: Path
     boxes: list[list[int]] = field(default_factory=list)
     scores: list[float] = field(default_factory=list)
+    text_boxes: list[list[int]] = field(default_factory=list)
     provisional: bool = False
     preview_path: Path | None = None
 
