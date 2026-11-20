@@ -304,7 +304,8 @@ class IdentitySafetyTests(unittest.TestCase):
         self.assertTrue(all(row["identity_status"] == "accepted_qwen_transformation"
                             for row in transformed))
         self.assertEqual(len(result["visual_groups"]), 2)
-        self.assertEqual(
+        # Accepted endpoints do not assign their unresolved group neighbours an identity/alias.
+        self.assertNotEqual(
             result["visual_groups"][0]["display_name"],
             result["visual_groups"][1]["display_name"],
         )

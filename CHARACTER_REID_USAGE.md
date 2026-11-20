@@ -2,8 +2,14 @@
 
 `test_character_reid.py` now performs manga-wide, precision-first visual matching.
 It does not load Qwen or automatically equate a creature with a human because a
-description suggests a transformation. It gives each retained visual group a
-stable fallback display name. The reusable Python implementation is in
+description suggests a transformation. It automatically assigns stable,
+pseudorandom gender-neutral surname aliases, without name extraction or review.
+Only retained ReID groups receive aliases; fully assigned groups of the same
+accepted entity share an alias. A single accepted member cannot transfer that
+alias to an otherwise unresolved group.
+Unmatched/filtered-out occurrences stay unnamed. Naming adds no separate
+appearance cutoff or manual confirmation gate. Aliases do not confirm identity.
+The reusable Python implementation is in
 `story_entities/`; JSON export belongs to the runner.
 
 ## 1. Prepare and run
@@ -99,7 +105,7 @@ There are two deliberately separate outputs:
   Only accepted identities enter the manga-wide `identities` list.
 
 With no review file or validated calibration, broad visual groups remain proposals
-and are never copied wholesale into narration. A recurrent subset can now receive
+and are not promoted to confirmed identities by their narration aliases. A recurrent subset can receive
 `accepted_automatic` only after representation typing removes toys/images/statues,
 at least three independent panels remain, grounded appearance traits agree, every
 member has two independent visual neighbours, and DINO plus CCIP agree when both
@@ -218,6 +224,11 @@ records must point to an accepted crop of that entity. The entity registry may
 store the name, but occurrence records expose it only at/after its reviewed reveal
 position (`naming_allowed`). Missing panel order prevents release. Keep aliases
 out of the canonical-name list; conflicting canonical names fail validation.
+Canonical names and their reveal gates are retained as optional evidence metadata;
+the writer uses generated aliases instead, with no canonical-name release gate.
+No manual review is required to assign or use an alias. Unmatched occurrences
+stay unnamed until ReID retains them in a group. The finite pool supports 200
+alias subjects; exceeding it fails explicitly rather than reusing a name.
 
 For a masked identity or a form whose connection is revealed later, add
 `identity_reveal_instance_id` to an accepted assignment. It identifies a crop at

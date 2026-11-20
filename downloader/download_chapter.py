@@ -1,9 +1,12 @@
 import asyncio
 import os
 import time
+import math
+import tempfile
 
 import httpx
 import config
+from common.progress import show_progress
 
 
 MAX_CONCURRENT_DOWNLOADS = 8
@@ -64,11 +67,13 @@ async def _get_at_home_server(
     # Keep the entire response/retry cycle serialized. If this request receives
     # 429, no other chapter can slip another API call into its cooldown window.
     async with limiter._request_lock:
-        while True:
+        for attempt in range(5):
             await limiter.wait()
-            response = await client.get(url)
+            response = await client.get(url, timeout=30)
 
             if response.status_code == 429:
+                if attempt == 4:
+                    response.raise_for_status()
                 retry_after = response.headers.get(
                     "X-RateLimit-Retry-After"
                 )
@@ -83,6 +88,7 @@ async def _get_at_home_server(
                         wait_time = 60
                 else:
                     wait_time = 60
+                wait_time = min(wait_time, 300) if math.isfinite(wait_time) else 60
 
                 print(
                     f"Rate limit reached. "
@@ -145,7 +151,7 @@ async def _download_image(
 ):
     """Download a single page while respecting the concurrency limit."""
 
-    if os.path.exists(image_path):
+    if os.path.isfile(image_path) and os.path.getsize(image_path) > 0:
         return False
 
     async with semaphore:
@@ -166,6 +172,7 @@ async def _download_image(
                         wait_time = float(retry_after)
                     except (TypeError, ValueError):
                         wait_time = 5
+                    wait_time = min(max(wait_time, 0), 300) if math.isfinite(wait_time) else 5
 
                     await cooldown.defer(wait_time)
                     retry_wait = 0
@@ -218,9 +225,17 @@ async def _download_image(
 
 def _write_file(path: str, content: bytes):
     """Write downloaded data without blocking the event loop."""
-
-    with open(path, "wb") as file:
-        file.write(content)
+    if not content:
+        raise ValueError(f"Empty downloaded page: {path}")
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=os.path.dirname(path), suffix=".part", delete=False) as file:
+            temporary = file.name
+            file.write(content)
+        os.replace(temporary, path)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 async def _download_chapter_with_client(
@@ -257,26 +272,37 @@ async def _download_chapter_with_client(
     source = _ChapterSource(chapter_id, data)
 
     tasks = []
+    paths = []
+    completed = 0
+    total = len(source.page_filenames)
+    label = f"Download chapter {chapter_index} pages"
+    show_progress(label, 0, total)
+
+    async def download_page(page_index, image_path):
+        nonlocal completed
+        result = await _download_image(
+            client, download_semaphore, image_cooldown, source, page_index,
+            image_path, at_home_limiter,
+        )
+        if os.path.isfile(image_path) and os.path.getsize(image_path) > 0:
+            completed += 1
+            show_progress(label, completed, total)
+        return result
+
     for page_index, filename in enumerate(source.page_filenames, start=1):
         extension = os.path.splitext(filename)[1]
         image_path = os.path.join(
             chapter_folder,
             f"{page_index:05d}{extension}",
         )
-        tasks.append(
-            _download_image(
-                client,
-                download_semaphore,
-                image_cooldown,
-                source,
-                page_index,
-                image_path,
-                at_home_limiter,
-            )
-        )
+        paths.append(image_path)
+        tasks.append(download_page(page_index, image_path))
 
     results = await asyncio.gather(*tasks)
     downloaded = sum(results)
+    missing = [path for path in paths if not os.path.isfile(path) or os.path.getsize(path) == 0]
+    if missing:
+        raise RuntimeError(f"Chapter {chapter_index}: {len(missing)} pages failed to download. Rerun to retry missing pages.")
     skipped = len(results) - downloaded
 
     print(

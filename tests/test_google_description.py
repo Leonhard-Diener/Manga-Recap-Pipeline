@@ -15,10 +15,29 @@ from description.google import (
 )
 from description.describer import _openrouter_bundle_schema, _remote_result
 from description.format import validate_format
-from test_description_google import _parser, main
+from test_description_google import _parser, main, cli
 
 
 class GoogleDescriptionClientTests(unittest.TestCase):
+    def test_cli_returns_failure_for_pending_pages_but_keeps_library_result(self):
+        for result, expected in [({"pending_pages": {"chapter": ["page.jpg"]}}, 2),
+                                 ({"pending_pages": {}}, 0), ({}, 0)]:
+            with self.subTest(result=result), patch("test_description_google.main", return_value=result):
+                self.assertEqual(cli(["Example"]), expected)
+
+    def test_truncated_repair_grows_budget_including_thinking_allowance(self):
+        client = Mock(provider_name="google")
+        client.complete_image.side_effect = [
+            {"content": '{"r":', "finish_reason": "length", "token_limit": 6304},
+            {"content": '{}', "finish_reason": "stop"},
+        ]
+        result = _remote_result(client, Path("page.jpg"), "Describe", None, 2208)
+        self.assertEqual(result["payload"], {})
+        self.assertEqual(client.complete_image.call_count, 2)
+        self.assertEqual(client.complete_image.call_args_list[0].kwargs["max_tokens"], 2208)
+        self.assertEqual(client.complete_image.call_args_list[1].kwargs["max_tokens"], 8512)
+        self.assertEqual(result["prior_raw_responses"], ['{"r":'])
+
     def test_runner_reports_incomplete_export_instead_of_success(self):
         result = {"pending_pages": {"chapter_001": ["00029.jpg"]}}
         with tempfile.TemporaryDirectory() as directory:

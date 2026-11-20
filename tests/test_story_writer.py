@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
+from PIL import Image
 from story_entities.manifest import file_hash
 from story_entities.matching import stable_id
 from story_writer.writer import (
@@ -51,7 +52,7 @@ def _fixture(root: Path) -> tuple[Path, list[Path], Path]:
     output = root / "output"
     chapter_output = output / manga.name / chapter.name
     chapter_output.mkdir(parents=True)
-    (chapter_output / "panel_0001.jpg").write_bytes(b"panel crop")
+    Image.new("RGB", (640, 480), "white").save(chapter_output / "panel_0001.jpg")
     source_hash = file_hash(source)
     geometry = "geometry_test"
     grounding = "grounding_test"
@@ -208,6 +209,7 @@ class StoryWriterTests(unittest.TestCase):
                 ("thought", "What happened?", None),
                 ("dialogue", "Anyone who sees it dies.", "instance_1"),
                 ("sound_effect", "BAM", None),
+                ("sign", "School entrance", None),
             ]
             classification["text_proposals"] = [{
                 "status": "accepted_automatic", "proposal_id": f"text_{index}",
@@ -219,19 +221,546 @@ class StoryWriterTests(unittest.TestCase):
             } for index, (kind, text, speaker) in enumerate(rows)]
             _write_json(classification_path, classification)
             panel = prepare_story(manga, chapters, output)["panels"][0]
-            self.assertEqual(len(panel["accepted_text_facts"]), 6)
+            self.assertEqual(len(panel["accepted_text_facts"]), 7)
             record = _panel_prompt_record(panel)
             self.assertEqual([fact["text"] for fact in record["accepted_text_facts"]],
-                             [rows[1][1], rows[4][1]])
-            self.assertEqual([fact["text"] for fact in record["unattributed_speech"]],
-                             [rows[2][1], rows[3][1]])
-            self.assertEqual(record["sound_effects_context_only"][0]["text"], "BAM")
+                             [rows[4][1], rows[6][1]])
+            self.assertEqual(record["story_context"], [rows[1][1]])
+            self.assertEqual([fact["text"] for fact in record["anonymous_dialogue"]],
+                             [rows[2][1]])
+            self.assertNotIn(rows[3][1], json.dumps(record))
+            self.assertNotIn("BAM", json.dumps(record))
             self.assertNotIn(rows[0][1], json.dumps(record))
             prompt = build_story_prompt([panel], completed_panels=[], previous_narration="",
                                         tokenizer=FakeTokenizer())
-            self.assertIn("unattributed_speech has NO known", prompt)
+            self.assertIn("anonymous_dialogue has NO known", prompt)
             self.assertIn("not mandatory", prompt)
+            self.assertIn("then prefer pronouns", prompt)
+            self.assertIn("story_context supplies narration", prompt)
+            self.assertIn("prefer a standalone exact quotation", prompt)
+            self.assertIn("Never guess a visible character", prompt)
+            self.assertIn("an audible voice from a thought", prompt)
+            self.assertNotIn("retain meaningful content as an unattributed warning/comment", prompt)
             self.assertNotIn(rows[0][1], prompt)
+
+    def test_source_commentary_is_rejected_but_direct_narration_is_accepted(self):
+        panel = {"panel_id": "p", "characters": []}
+        bad = ["Narration captions hail this figure as the strongest.",
+               "An unattributed warning states that flying is banned.",
+               "An exclamation appears above the building.",
+               "A close-up shows a character staring forward.",
+               "A shot displays the school building.",
+               "A shot of the school appears.",
+               "Signs declare him the Demon King.",
+               "Signs above read Demon King.",
+               "Another view of the same student stands in the background.",
+               "A title declares the demon king the strongest.",
+               "Someone shouts as the scene shifts to the school.",
+               "Someone shouts as the scene shows a building.",
+               "An anonymous voice warns that flying is banned.",
+               "Someone shouts with a sound effect.",
+               "The caption reads that he has never lost."]
+        good = ["The strongest warrior has never been defeated.",
+                "Someone warns that flying is banned.",
+                "Someone shouts, 'Hey!'", "He reads a warning on the door."]
+        for text in bad + good:
+            with self.subTest(text=text):
+                raw = json.dumps({"segments": [{
+                    "primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                    "text": text, "used_instance_ids": [], "name_uses": [],
+                }]})
+                _, errors = validate_story_response(raw, [panel])
+                self.assertEqual(bool(errors), text in bad)
+
+    def test_long_previous_chunk_paragraph_cannot_be_reused_for_a_different_panel(self):
+        text = "A student kneels in front of the toy machine while another watches from nearby."
+        panel = {"panel_id": "new", "characters": []}
+        raw = json.dumps({"segments": [{
+            "primary_panel_id": "new", "supporting_panel_ids": ["new"],
+            "text": text, "used_instance_ids": [], "name_uses": [],
+        }]})
+        _, errors = validate_story_response(raw, [panel], previous_segments=[{"text": text}])
+        self.assertTrue(any("repeats previously completed narration" in error for error in errors))
+
+    def test_reference_style_rejects_clones_name_spam_and_drawing_language(self):
+        panel = {"panel_id": "p", "characters": [{"instance_id": "i", "allowed_name": "Yamazaki"}]}
+        bad = ["Yamazaki points while another Yamazaki stands behind him.",
+               "Yamazaki looks down. Yamazaki frowns. Yamazaki turns away.",
+               "Yamazaki recoils. Someone shouts a warning. Yamazaki threatens to fight.",
+               "A boy named Yamazaki looks down.",
+               "She stands amidst lightning effects.",
+               "A group of small characters stands nearby."]
+        good = ["Yamazaki looks down. He frowns and turns away.",
+                "She stands near the people in the background."]
+        for text in bad + good:
+            uses_name = "Yamazaki" in text
+            raw = json.dumps({"segments": [{
+                "primary_panel_id": "p", "supporting_panel_ids": ["p"], "text": text,
+                "used_instance_ids": ["i"] if uses_name else [],
+                "name_uses": [{"name": "Yamazaki", "instance_id": "i"}] if uses_name else [],
+            }]})
+            with self.subTest(text=text):
+                _, errors = validate_story_response(raw, [panel])
+                self.assertEqual(bool(errors), text in bad, errors)
+
+    def test_reference_context_carries_aliases_not_previous_scene_prose(self):
+        base = {"chapter": "chapter", "page": "page", "panel_number": 1,
+                "description": "A student waits.", "accepted_actions": [],
+                "accepted_transformations": [], "characters": [{"instance_id": "i", "allowed_name": "Yamazaki"}]}
+        previous = [{"panel_id": "old", **base}]
+        segments = [{"used_instance_ids": ["i"], "name_uses": [{"name": "Yamazaki", "instance_id": "i"}]}]
+        prompt = build_story_prompt([{**base, "panel_id": "new"}], completed_panels=previous,
+                                    previous_narration="An unrelated dragon breathes fire.",
+                                    previous_segments=segments, tokenizer=FakeTokenizer())
+        context = json.loads(prompt.split("Grounded input:\n")[1].split("\nGenerate exactly")[0])
+        self.assertIsNone(context["reference_context"]["last_unambiguous_subject"])
+        self.assertEqual(context["reference_context"]["previously_used_aliases"], [])
+        self.assertNotIn("Yamazaki", prompt)
+        self.assertNotIn("An unrelated dragon", prompt)
+        unnamed = {**base, "panel_id": "new", "characters": [{"instance_id": "unknown", "allowed_name": None}]}
+        prompt = build_story_prompt([unnamed], completed_panels=previous,
+                                    previous_narration="", previous_segments=segments, tokenizer=FakeTokenizer())
+        context = json.loads(prompt.split("Grounded input:\n")[1].split("\nGenerate exactly")[0])
+        self.assertIsNone(context["reference_context"]["last_unambiguous_subject"])
+        self.assertEqual(context["reference_context"]["previously_used_aliases"], [])
+        self.assertNotIn("Yamazaki", prompt)
+
+    def test_writer_input_omits_drawing_conventions_without_mutating_evidence(self):
+        panel = {"chapter": "chapter", "page": "page", "panel_number": 1, "panel_id": "p",
+                 "description": "A horned female character stands amidst electrical lightning and impact effects near a smaller group of characters.",
+                 "characters": [{"instance_id": "i", "allowed_reference": "the group of small characters",
+                                 "visual_description": "Small characters standing nearby"}],
+                 "accepted_actions": [], "accepted_transformations": []}
+        before = json.dumps(panel)
+        record = _panel_prompt_record(panel)
+        self.assertEqual(record["description"], "A horned female character stands near a group of characters.")
+        self.assertEqual(record["characters"][0]["allowed_reference"], "the group")
+        self.assertEqual(json.dumps(panel), before)
+        panel["description"] = ("A student shouts and points forward. Another full-body view of the same character stands in the background.")
+        self.assertEqual(_panel_prompt_record(panel)["description"], "A student shouts and points forward.")
+        panel["description"] = "Lightning strikes a tree. A small toy falls."
+        self.assertEqual(_panel_prompt_record(panel)["description"], panel["description"])
+        panel["description"] = "A miniature version of a character stands nearby."
+        panel["characters"][0]["allowed_reference"] = "a miniature character standing upright"
+        panel["characters"][0]["visual_description"] = "a miniature character standing upright"
+        panel["accepted_text_facts"] = [{"kind": "dialogue", "speaker_instance_id": "i", "text": "Hello."}]
+        record = _panel_prompt_record(panel)
+        self.assertEqual(record["description"], "A character stands nearby.")
+        self.assertEqual(record["accepted_text_facts"][0]["speaker_reference"], "the character")
+
+    def test_recent_alias_is_hidden_from_prompt_schema_and_action_references(self):
+        panel = {"chapter": "chapter", "page": "page", "panel_number": 1, "panel_id": "new",
+                 "description": "A girl looks down.", "accepted_actions": [{"actor_reference": "Yamazaki"}],
+                 "accepted_transformations": [], "characters": [{"instance_id": "i", "allowed_name": "Yamazaki",
+                    "allowed_reference": "Yamazaki", "visual_description": "a girl with horns"}]}
+        previous = [{"text": "Yamazaki looks away.", "name_uses": [{"name": "Yamazaki", "instance_id": "old"}]}]
+        before = json.dumps(panel)
+        prompt = build_story_prompt([panel], completed_panels=[], previous_narration="",
+                                    previous_segments=previous, tokenizer=FakeTokenizer())
+        schema = _story_response_schema([panel], previous)
+        self.assertNotIn("Yamazaki", prompt)
+        self.assertNotIn("Yamazaki", json.dumps(schema))
+        self.assertIn('"allowed_reference":"she"', prompt)
+        self.assertEqual(json.dumps(panel), before)
+        raw = json.dumps({"segments": [{"primary_panel_id": "new", "supporting_panel_ids": ["new"],
+            "text": "Yamazaki looks down.", "used_instance_ids": ["i"],
+            "name_uses": [{"name": "Yamazaki", "instance_id": "i"}]}]})
+        for history in (previous, previous + [{"text": "The door opens.", "name_uses": []}]):
+            _, errors = validate_story_response(raw, [panel], previous_segments=history)
+            self.assertTrue(any("name-frequency" in e for e in errors), errors)
+        _, errors = validate_story_response(raw, [panel], previous_segments=previous + [
+            {"text": "The door opens.", "name_uses": []}, {"text": "She walks inside.", "name_uses": []}])
+        self.assertFalse(errors, errors)
+
+    def test_prompt_identity_ids_do_not_leak_names_and_canonical_names_are_rejected(self):
+        panel = {"chapter": "chapter", "page": "page", "panel_number": 1, "panel_id": "p",
+                 "description": "A girl looks down.", "accepted_actions": [], "accepted_transformations": [],
+                 "characters": [{"instance_id": "i", "entity_id": "entity_lucia", "form_id": "form_lucia_school",
+                                 "allowed_name": "Yamazaki", "allowed_reference": "Yamazaki"}]}
+        prompt = build_story_prompt([panel], completed_panels=[], previous_narration="", tokenizer=FakeTokenizer())
+        self.assertNotIn("lucia", prompt.lower())
+        self.assertIn('"instance_id":"i"', prompt)
+        raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+            "text": "Lucia looks down.", "used_instance_ids": ["i"], "name_uses": []}]})
+        _, errors = validate_story_response(raw, [panel], known_names={"Lucia"})
+        self.assertTrue(any("does not ground the name" in e for e in errors), errors)
+
+    def test_self_introduction_uses_alias_or_title_without_changing_saved_speech(self):
+        panel = {"chapter": "chapter", "page": "page", "panel_number": 1, "panel_id": "p",
+                 "description": "A girl introduces herself.", "accepted_actions": [], "accepted_transformations": [],
+                 "characters": [{"instance_id": "i", "allowed_name": "Yamazaki", "allowed_reference": "Yamazaki"}],
+                 "accepted_text_facts": [{"kind": "dialogue", "speaker_instance_id": "i",
+                                          "text": "I AM LUCIA, THE DEMON KING."}]}
+        before = json.dumps(panel)
+        record = _panel_prompt_record(panel, ["Lucia"])
+        self.assertEqual(record["accepted_text_facts"][0]["text"], "I AM Yamazaki, THE DEMON KING.")
+        prompt = build_story_prompt([panel], completed_panels=[], previous_narration="", tokenizer=FakeTokenizer(),
+                                    canonical_names=["Lucia"], suppress_names=True)
+        self.assertNotIn("LUCIA", prompt)
+        self.assertNotIn("Yamazaki", prompt)
+        self.assertIn("I am THE DEMON KING.", prompt)
+        self.assertEqual(json.dumps(panel), before)
+        panel["accepted_text_facts"][0]["text"] = "I AM LUCIA."
+        panel["characters"][0]["allowed_name"] = None
+        self.assertEqual(_panel_prompt_record(panel, ["Lucia"])["accepted_text_facts"][0]["text"],
+                         "The speaker introduces themself.")
+
+    def test_known_speech_uses_its_reference_while_unknown_speech_stays_anonymous(self):
+        panel = {"chapter": "chapter", "page": "page", "panel_number": 1, "panel_id": "p",
+                 "description": "A boy looks surprised.", "accepted_actions": [], "accepted_transformations": [],
+                 "characters": [{"instance_id": "i", "allowed_name": None, "allowed_reference": "he"}],
+                 "accepted_text_facts": [{"kind": "dialogue", "speaker_instance_id": "i", "text": "Is that really true?"}]}
+        record = _panel_prompt_record(panel)
+        self.assertEqual(record["accepted_text_facts"][0]["speaker_reference"], "he")
+        for text, invalid in [("He asks whether it is really true.", False),
+                              ("Someone else asks whether it is really true.", True),
+                              ("He looks surprised. Someone asks whether it is true.", True),
+                              ("He says that someone warns her about the danger.", False)]:
+            raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                "text": text, "used_instance_ids": ["i"], "name_uses": []}]})
+            _, errors = validate_story_response(raw, [panel])
+            self.assertEqual(bool(errors), invalid, errors)
+        panel["accepted_text_facts"][0]["speaker_instance_id"] = None
+        record = _panel_prompt_record(panel)
+        self.assertFalse(record["accepted_text_facts"])
+        self.assertIsNone(record["anonymous_dialogue"][0]["speaker_reference"])
+        raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+            "text": "Someone asks whether it is really true.", "used_instance_ids": [], "name_uses": []}]})
+        _, errors = validate_story_response(raw, [panel])
+        self.assertFalse(errors, errors)
+        panel["accepted_text_facts"].append({"kind": "dialogue", "speaker_instance_id": "i", "text": "It is difficult."})
+        raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+            "text": "He says it is difficult while asking whether it is really true.",
+            "used_instance_ids": ["i"], "name_uses": []}]})
+        _, errors = validate_story_response(raw, [panel])
+        self.assertTrue(any("unknown dialogue explicitly anonymous" in error for error in errors), errors)
+
+    def test_exact_grounded_physical_sign_does_not_block_narration(self):
+        panel = {"panel_id": "p", "characters": [],
+                 "accepted_text_facts": [{"kind": "sign", "text": "TOY"}]}
+        for text, invalid in [("The sign reads TOY.", False),
+                              ("The sign reads 'TOY'.", False),
+                              ("The sign reads DANGER near a toy machine.", True),
+                              ("The sign reads TOY. A caption declares him the strongest.", True),
+                              ("A caption reads TOY.", True)]:
+            raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                "text": text, "used_instance_ids": [], "name_uses": []}]})
+            with self.subTest(text=text):
+                _, errors = validate_story_response(raw, [panel])
+                self.assertEqual(bool(errors), invalid, errors)
+
+    def test_name_frequency_retry_changes_input_instead_of_replaying_named_response(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            named = json.dumps({"segments": [{"primary_panel_id": "panel_test_1", "supporting_panel_ids": ["panel_test_1"],
+                "text": "Akira turns away. Akira looks down.", "used_instance_ids": ["instance_1"],
+                "name_uses": [{"name": "Akira", "instance_id": "instance_1"}]}]})
+            corrected = json.dumps({"segments": [{"primary_panel_id": "panel_test_1", "supporting_panel_ids": ["panel_test_1"],
+                "text": "She turns away and looks down.", "used_instance_ids": ["instance_1"], "name_uses": []}]})
+            with patch("story_writer.writer.generate_response", side_effect=[
+                (named, {"truncated": False}), (corrected, {"truncated": False}),
+            ]) as calls:
+                result = generate_story(prepared, FakeProcessor(), object(), output)
+            self.assertEqual(result["segments"][0]["text"], "She turns away and looks down.")
+            self.assertNotIn("Akira", calls.call_args_list[1].args[2])
+            self.assertNotIn("Akira", json.dumps(calls.call_args_list[1].kwargs["response_schema"]))
+
+    def test_repeated_narration_is_allowed_for_identical_current_descriptions(self):
+        description = "A steaming food steamer basket is lifted to reveal a head with horns inside."
+        text = "A basket is lifted through rising steam to reveal a horned head resting inside."
+        previous = {"panel_id": "old", "characters": [], "description": description}
+        current = {"panel_id": "new", "characters": [], "description": description}
+        for narration in (description, text):
+            raw = json.dumps({"segments": [{
+                "primary_panel_id": "new", "supporting_panel_ids": ["new"],
+                "text": narration, "used_instance_ids": [], "name_uses": [],
+            }]})
+            prior = [{"primary_panel_id": "old", "text": narration}]
+            _, errors = validate_story_response(raw, [current], supporting_panels=[previous, current],
+                                                 previous_segments=prior)
+            self.assertFalse(errors, errors)
+            current["description"] = "A student runs down the school corridor."
+            _, errors = validate_story_response(raw, [current], supporting_panels=[previous, current],
+                                                 previous_segments=prior)
+            self.assertTrue(any("repeats previously completed narration" in error for error in errors))
+            current["description"] = description
+
+    def test_unused_name_declaration_retries_without_replaying_names_or_weakening_validation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            segment = {"primary_panel_id": "panel_test_1", "supporting_panel_ids": ["panel_test_1"],
+                       "text": "She turns away and looks down.", "used_instance_ids": ["instance_1"],
+                       "name_uses": [{"name": "Akira", "instance_id": "instance_1"}]}
+            invalid = json.dumps({"segments": [segment]})
+            _, errors = validate_story_response(invalid, prepared["panels"])
+            self.assertTrue(any("declares a name that is not in its text" in error for error in errors))
+            corrected = json.dumps({"segments": [dict(segment, name_uses=[])]})
+            with patch("story_writer.writer.generate_response", side_effect=[
+                (invalid, {"truncated": False}), (corrected, {"truncated": False}),
+            ]) as calls:
+                result = generate_story(prepared, FakeProcessor(), object(), output)
+            self.assertEqual(calls.call_count, 2)
+            self.assertNotIn("Akira", calls.call_args_list[1].args[2])
+            schema = calls.call_args_list[1].kwargs["response_schema"]
+            self.assertNotIn("Akira", json.dumps(schema))
+            self.assertEqual(schema["properties"]["segments"]["items"]["anyOf"][0]["properties"]["name_uses"]["maxItems"], 0)
+            self.assertEqual(result["segments"][0]["text"], segment["text"])
+            self.assertEqual(result["segments"][0]["name_uses"], [])
+            progress = json.loads((output / "Example Manga_story_progress.json").read_text(encoding="utf-8"))
+            attempt = progress["chunks"][0]["attempts"][0]
+            self.assertEqual(Path(attempt["raw_response"]).read_text(encoding="utf-8"), invalid)
+
+    def test_name_suppression_survives_retry_cycles_and_keeps_dialogue_repair_feedback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            prepared["panels"][0]["accepted_text_facts"] = [
+                {"kind": "dialogue", "text": "Pardon?", "speaker_instance_id": None}]
+            segment = {"primary_panel_id": "panel_test_1", "supporting_panel_ids": ["panel_test_1"],
+                       "text": "She turns away. Someone asks, 'Pardon?'", "used_instance_ids": ["instance_1"],
+                       "name_uses": [{"name": "Akira", "instance_id": "instance_1"}]}
+            phantom = json.dumps({"segments": [segment]})
+            omitted = json.dumps({"segments": [dict(segment, text="She turns away and looks down.", name_uses=[])]})
+            corrected = json.dumps({"segments": [dict(segment, name_uses=[])]})
+            with patch("story_writer.writer.generate_response", side_effect=[
+                (phantom, {"truncated": False}), (omitted, {"truncated": False}),
+                (corrected, {"truncated": False}),
+            ]) as calls, patch("story_writer.writer.time.sleep"):
+                result = generate_story(prepared, FakeProcessor(), object(), output)
+            self.assertEqual(calls.call_count, 3)
+            for call in calls.call_args_list[1:]:
+                self.assertNotIn("Akira", call.args[2])
+                self.assertNotIn("Akira", json.dumps(call.kwargs["response_schema"]))
+            self.assertIn("omits brief anonymous dialogue", calls.call_args_list[2].args[2])
+            self.assertIn("Pardon?", calls.call_args_list[2].args[2])
+            self.assertNotIn("Previous failed response", calls.call_args_list[2].args[2])
+            self.assertEqual(result["segments"][0]["text"], segment["text"])
+
+    def test_brief_anonymous_interjection_cannot_be_omitted(self):
+        panel = {"panel_id": "p", "characters": [], "accepted_text_facts": [{
+            "kind": "dialogue", "text": "HEY!!", "speaker_instance_id": None,
+        }]}
+        for text, invalid in [("A school stands under a cloudy sky.", True),
+                              ("Someone shouts, 'Hey!' outside the school.", False)]:
+            raw = json.dumps({"segments": [{
+                "primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                "text": text, "used_instance_ids": [], "name_uses": [],
+            }]})
+            _, errors = validate_story_response(raw, [panel])
+            self.assertEqual(bool(errors), invalid)
+
+    def test_unknown_dialogue_can_be_a_standalone_quote_without_someone_or_a_guessed_speaker(self):
+        panel = {"panel_id": "p", "characters": [], "accepted_text_facts": [
+            {"kind": "dialogue", "text": "Pardon?", "speaker_instance_id": None}]}
+        cases = [('"Pardon?"', False), ('“Pardon?”', False),
+                 ('She turns away. "Pardon?"', False), ('"Pardon?" She turns away.', False),
+                 ('He asks, "Pardon?"', True), ('"Pardon?", he asks.', True),
+                 ('"Pardon?" he asks.', True), ('"I will attack."', True),
+                 ('He turns away.', True)]
+        for text, invalid in cases:
+            raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                "text": text, "used_instance_ids": [], "name_uses": []}]})
+            with self.subTest(text=text):
+                _, errors = validate_story_response(raw, [panel])
+                self.assertEqual(bool(errors), invalid, errors)
+
+    def test_unknown_speech_retry_does_not_replay_the_guessed_speaker(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            panel = prepared["panels"][0]
+            panel["accepted_text_facts"] = [{"kind": "dialogue", "text": "...I've been waiting for you",
+                                             "speaker_instance_id": None}]
+            segment = {"primary_panel_id": panel["panel_id"], "supporting_panel_ids": [panel["panel_id"]],
+                       "text": 'The character says, "I\'ve been waiting for you."',
+                       "used_instance_ids": [], "name_uses": []}
+            invalid = json.dumps({"segments": [segment]})
+            corrected_text = '“...I\'ve been waiting for you.” The student runs through the corridor.'
+            corrected = json.dumps({"segments": [dict(segment, text=corrected_text, used_instance_ids=["instance_1"])]})
+            with patch("story_writer.writer.generate_response", side_effect=[
+                (invalid, {"truncated": False}), (corrected, {"truncated": False}),
+            ]) as calls:
+                story = generate_story(prepared, FakeProcessor(), object(), output)
+            self.assertNotIn("Previous failed response", calls.call_args_list[1].args[2])
+            self.assertNotIn(segment["text"], calls.call_args_list[1].args[2])
+            self.assertIn("UNASSIGNED QUOTATIONS", calls.call_args_list[1].args[2])
+            self.assertIn("...I've been waiting for you", calls.call_args_list[1].args[2])
+            properties = calls.call_args_list[1].kwargs["response_schema"]["properties"]["segments"]["items"]["anyOf"][0]["properties"]
+            self.assertNotIn("enum", properties["text"])  # Accepted actions must remain narratable.
+            self.assertRegex(corrected_text, properties["text"]["pattern"])
+            self.assertTrue(properties["text"]["pattern"].startswith("^“"))
+            self.assertEqual(json.loads(json.dumps(corrected_text, ensure_ascii=False)), corrected_text)
+            self.assertNotRegex(segment["text"], properties["text"]["pattern"])
+            self.assertNotRegex(corrected_text + '\",\"used_instance_ids\":[\"wrong\"]', properties["text"]["pattern"])
+            self.assertNotRegex(corrected_text + '\\nMore text', properties["text"]["pattern"])
+            self.assertEqual(story["segments"][0]["text"], corrected_text)
+
+    def test_consecutive_unknown_quotations_are_checked_without_consuming_each_others_boundaries(self):
+        panel = {"panel_id": "p", "characters": [], "accepted_text_facts": [
+            {"kind": "dialogue", "text": "PYRO BURGUNDY!", "speaker_instance_id": None},
+            {"kind": "dialogue", "text": "LET THE BRILLIANCE OF YOUR LIFE BURN BRIGHT!", "speaker_instance_id": None}]}
+        quotes = '"PYRO BURGUNDY!" "LET THE BRILLIANCE OF YOUR LIFE BURN BRIGHT!"'
+        cases = [(quotes, False), ("He points. " + quotes, False),
+                 ('“PYRO BURGUNDY!” “LET THE BRILLIANCE OF YOUR LIFE BURN BRIGHT!”', False),
+                 ("He says, " + quotes, True), ('"PYRO BURGUNDY!"', True),
+                 ('"LET THE BRILLIANCE OF YOUR LIFE BURN BRIGHT!"', True)]
+        for text, invalid in cases:
+            raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                "text": text, "used_instance_ids": [], "name_uses": []}]})
+            with self.subTest(text=text):
+                _, errors = validate_story_response(raw, [panel])
+                self.assertEqual(bool(errors), invalid, errors)
+
+    def test_speech_only_unknown_retry_schema_forbids_invented_attribution(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            panel = prepared["panels"][0]
+            panel.update(accepted_actions=[], accepted_transformations=[], accepted_text_facts=[
+                {"kind": "dialogue", "text": "...I've been waiting for you", "speaker_instance_id": None}])
+            base = {"primary_panel_id": panel["panel_id"], "supporting_panel_ids": [panel["panel_id"]],
+                    "used_instance_ids": [], "name_uses": []}
+            invalid = json.dumps({"segments": [dict(base, text='The character says, "I\'ve been waiting for you."')]})
+            corrected = json.dumps({"segments": [dict(base, text='"...I\'ve been waiting for you."')]})
+            with patch("story_writer.writer.generate_response", side_effect=[
+                (invalid, {"truncated": False}), (corrected, {"truncated": False}),
+            ]) as calls:
+                story = generate_story(prepared, FakeProcessor(), object(), output)
+            properties = calls.call_args_list[1].kwargs["response_schema"]["properties"]["segments"]["items"]["anyOf"][0]["properties"]
+            self.assertEqual(properties["text"]["enum"], ['"...I\'ve been waiting for you."'])
+            self.assertEqual(properties["used_instance_ids"]["maxItems"], 0)
+            self.assertEqual(properties["name_uses"]["maxItems"], 0)
+            self.assertEqual(story["segments"][0]["text"], '"...I\'ve been waiting for you."')
+
+    def test_short_reference_uses_evidence_not_outfits_alias_gender_or_group_members(self):
+        panel = {"chapter": "chapter", "page": "page", "panel_number": 1, "panel_id": "p",
+                 "description": "A girl screams while a boy turns away.",
+                 "characters": [
+                     {"instance_id": "girl", "allowed_name": None,
+                      "allowed_reference": "the blonde girl with a long skirt and boots",
+                      "visual_description": "blonde girl with a long skirt and boots"},
+                     {"instance_id": "boy", "allowed_name": None,
+                      "allowed_reference": "the dark-haired boy in a long coat",
+                      "visual_description": "dark-haired boy in a long coat"}],
+                 "accepted_actions": [{"actor_instance_id": "girl", "actor_reference": "the blonde girl with a long skirt",
+                                       "text": "screams"}], "accepted_transformations": [],
+                 "accepted_text_facts": [{"kind": "dialogue", "text": "Run!", "speaker_instance_id": "girl"}]}
+        before = json.dumps(panel)
+        record = _panel_prompt_record(panel)
+        self.assertEqual([c["allowed_reference"] for c in record["characters"]], ["she", "he"])
+        self.assertEqual(record["characters"][0]["visual_description"], "the blonde girl")
+        self.assertEqual(record["accepted_text_facts"][0]["speaker_reference"], "she")
+        self.assertEqual(record["accepted_actions"][0]["actor_reference"], "she")
+        self.assertNotIn("skirt", json.dumps(record))
+        self.assertEqual(json.dumps(panel), before)
+        panel["characters"] = [{"instance_id": "unknown", "allowed_name": "Akira",
+                                "visual_description": "a demon king with horns"}]
+        panel["description"] = "A horned character looks forward."
+        panel["accepted_text_facts"] = [{"kind": "dialogue", "text": "Run!", "speaker_instance_id": "unknown"}]
+        record = _panel_prompt_record(panel)
+        self.assertEqual(record["accepted_text_facts"][0]["speaker_reference"], "the horned character")
+
+    def test_anonymous_declaration_is_valid_but_must_not_replace_a_known_speaker(self):
+        panel = {"panel_id": "p", "characters": [], "description": "A hand holding an ornate dagger",
+                 "accepted_text_facts": [{"kind": "dialogue", "text": "Then I'll take her",
+                                          "speaker_instance_id": None}]}
+        for text in ["A hand grips an ornate dagger as someone declares, 'Then I'll take her.'",
+                     "A hand holds an ornate dagger while someone declares, 'Then I'll take her.'",
+                     "Someone declares, 'Then I'll take her.'"]:
+            raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                "text": text, "used_instance_ids": [], "name_uses": []}]})
+            with self.subTest(text=text):
+                _, errors = validate_story_response(raw, [panel])
+                self.assertFalse(errors, errors)
+        panel["accepted_text_facts"][0]["speaker_instance_id"] = "i"
+        _, errors = validate_story_response(raw, [panel])
+        self.assertTrue(any("anonymizes known speech" in error for error in errors), errors)
+
+    def test_common_reporting_verbs_keep_unknown_speech_anonymous(self):
+        panel = {"panel_id": "p", "characters": [], "accepted_text_facts": [
+            {"kind": "dialogue", "text": "I swear to protect Celestine for the rest of my life",
+             "speaker_instance_id": None}]}
+        verbs = ("swears", "vows", "promises", "announces", "explains", "insists", "admits", "agrees",
+                 "answers", "demands", "calls", "cries", "screams", "tells", "retorts", "protests",
+                 "reassures", "repeats", "recounts", "continues", "pleads", "begs", "replies", "declares")
+        for verb in verbs:
+            raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                "text": f"Someone {verb} to protect Celestine for the rest of his life.",
+                "used_instance_ids": [], "name_uses": []}]})
+            with self.subTest(verb=verb):
+                panel["accepted_text_facts"][0]["speaker_instance_id"] = None
+                _, errors = validate_story_response(raw, [panel])
+                self.assertFalse(errors, errors)
+                panel["accepted_text_facts"][0]["speaker_instance_id"] = "i"
+                _, errors = validate_story_response(raw, [panel])
+                self.assertTrue(any("anonymizes known speech" in error for error in errors), errors)
+
+    def test_anonymous_speech_allows_adverbs_but_not_a_different_named_subject(self):
+        panel = {"panel_id": "p", "characters": [], "accepted_text_facts": [
+            {"kind": "dialogue", "text": "Has anyone been bullying you?", "speaker_instance_id": None}]}
+        for subject in ("Someone nearby", "Someone quietly", "Someone off-screen", "Someone off screen",
+                        "Somebody nearby quietly", "A voice elsewhere", "Someone then", "Someone still"):
+            text = f"{subject} warns, 'Has anyone been bullying you?'"
+            raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+                "text": text, "used_instance_ids": [], "name_uses": []}]})
+            with self.subTest(subject=subject):
+                panel["accepted_text_facts"][0]["speaker_instance_id"] = None
+                _, errors = validate_story_response(raw, [panel])
+                self.assertFalse(errors, errors)
+                panel["accepted_text_facts"][0]["speaker_instance_id"] = "i"
+                _, errors = validate_story_response(raw, [panel])
+                self.assertTrue(any("anonymizes known speech" in error for error in errors), errors)
+        panel["accepted_text_facts"][0]["speaker_instance_id"] = None
+        raw = json.dumps({"segments": [{"primary_panel_id": "p", "supporting_panel_ids": ["p"],
+            "text": "Someone stands nearby while she warns, 'Has anyone been bullying you?'",
+            "used_instance_ids": [], "name_uses": []}]})
+        _, errors = validate_story_response(raw, [panel])
+        self.assertTrue(any("unknown dialogue explicitly anonymous" in error for error in errors), errors)
+
+    def test_source_commentary_is_repaired_before_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            def response(text):
+                return json.dumps({"segments": [{
+                    "primary_panel_id": "panel_test_1", "supporting_panel_ids": ["panel_test_1"],
+                    "text": text, "used_instance_ids": [], "name_uses": [],
+                }]})
+            raw = response("An unattributed warning states that flying is banned.")
+            repaired = response("Someone warns that flying is banned.")
+            with patch("story_writer.writer.generate_response", side_effect=[
+                (raw, {"truncated": False}), (repaired, {"truncated": False}),
+            ]) as call:
+                story = generate_story(prepared, FakeProcessor(), object(), output)
+            self.assertEqual(call.call_count, 2)
+            self.assertIn("'unattributed' reports source presentation", call.call_args_list[1].args[2])
+            self.assertEqual(story["segments"][0]["text"], "Someone warns that flying is banned.")
+
+    def test_sound_effect_suffix_is_removed_only_from_retry_input_without_dropping_panel(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            panel = prepared["panels"][0]
+            panel.update(description="A banner at the bottom with text and a sound effect.",
+                         characters=[], accepted_text_facts=[], accepted_actions=[])
+            def response(text):
+                return json.dumps({"segments": [{"primary_panel_id": panel["panel_id"],
+                    "supporting_panel_ids": [panel["panel_id"]], "text": text,
+                    "used_instance_ids": [], "name_uses": []}]})
+            invalid = response("A banner displays text and a sound effect at the bottom.")
+            corrected = response("A banner with text sits at the bottom.")
+            with patch("story_writer.writer.generate_response", side_effect=[
+                (invalid, {"truncated": False}), (corrected, {"truncated": False}),
+            ]) as calls:
+                story = generate_story(prepared, FakeProcessor(), object(), output)
+            context = json.loads(calls.call_args_list[1].args[2].split("\nGrounded input:\n")[1].split("\nGenerate exactly")[0])
+            self.assertEqual(context["next_panels"][0]["description"], "A banner at the bottom with text.")
+            self.assertNotIn("Previous failed response", calls.call_args_list[1].args[2])
+            self.assertEqual(panel["description"], "A banner at the bottom with text and a sound effect.")
+            self.assertEqual(len(story["segments"]), 1)
+            self.assertEqual(story["segments"][0]["text"], "A banner with text sits at the bottom.")
 
     def test_unresolved_optional_review_does_not_block_story(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -265,6 +794,21 @@ class StoryWriterTests(unittest.TestCase):
             self.assertIsNone(fact["allowed_name"])
             self.assertEqual(fact["allowed_reference"], "the horned student")
             self.assertEqual(prepared["panels"][0]["accepted_actions"], [])
+
+    def test_unknown_identity_uses_generated_alias_without_a_review(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            path = output / manga.name / "character_classification.json"
+            classification = json.loads(path.read_text(encoding="utf-8"))
+            classification["characters"][0].update(
+                entity_id=None, form_id=None, identity_status="unknown",
+                name="Canonical name", naming_allowed=True,
+                display_name="Yamazaki", display_name_allowed=True,
+            )
+            _write_json(path, classification)
+            panel = prepare_story(manga, chapters, output)["panels"][0]
+            self.assertEqual(panel["characters"][0]["allowed_name"], "Yamazaki")
+            self.assertEqual(panel["accepted_actions"][0]["actor_reference"], "Yamazaki")
 
     def test_ambiguous_panel_keeps_model_text_without_replacement(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -483,6 +1027,8 @@ class StoryWriterTests(unittest.TestCase):
             self.assertTrue((output / "Example Manga_story.txt").is_file())
             self.assertTrue((output / "Example Manga_story.json").is_file())
             self.assertTrue((output / "Example Manga_panel_timeline.json").is_file())
+            timeline = json.loads((output / "Example Manga_panel_timeline.json").read_text())
+            self.assertEqual(timeline["display_groups"][0]["panel_ids"], ["panel_test_1"])
 
             with patch("story_writer.writer.generate_response", side_effect=AssertionError("must resume")):
                 resumed = generate_story(prepared, FakeProcessor(), object(), output)
@@ -507,7 +1053,7 @@ class StoryWriterTests(unittest.TestCase):
             call.assert_called_once()
             self.assertEqual(story["segments"][0]["text"], "She utters the words you in hesitation.")
 
-    def test_invalid_single_panel_stops_without_publishing_fallback(self):
+    def test_invalid_single_panel_waits_and_retries_without_publishing_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
             manga, chapters, output = _fixture(Path(temporary))
             prepared = prepare_story(manga, chapters, output)
@@ -516,9 +1062,10 @@ class StoryWriterTests(unittest.TestCase):
             with patch(
                 "story_writer.writer.generate_response",
                 return_value=("not json", generation),
-            ) as call:
-                with self.assertRaisesRegex(ValueError, "no failure-splitting or automatic fallback"):
+            ) as call, patch("story_writer.writer.time.sleep", side_effect=KeyboardInterrupt) as wait:
+                with self.assertRaises(KeyboardInterrupt):
                     generate_story(prepared, FakeProcessor(), object(), output)
+            wait.assert_called_once_with(5)
             self.assertEqual(call.call_count, 2)
             progress = json.loads(
                 (output / "Example Manga_story_progress.json").read_text(encoding="utf-8")
@@ -533,7 +1080,56 @@ class StoryWriterTests(unittest.TestCase):
             self.assertIn("Previous failed response", call.call_args_list[1].args[2])
             self.assertIn("not json", call.call_args_list[1].args[2])
 
-    def test_failed_multi_panel_chunk_never_splits(self):
+    def test_single_panel_eventually_recovers_without_manual_restart(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            valid = json.dumps({"segments": [{
+                "primary_panel_id": "panel_test_1", "supporting_panel_ids": ["panel_test_1"],
+                "text": "The door opens slowly.", "used_instance_ids": [], "name_uses": [],
+            }]})
+            with patch("story_writer.writer.generate_response", side_effect=[
+                ("bad json", {"truncated": False}), ("still bad", {"truncated": False}),
+                (valid, {"truncated": False}),
+            ]) as call, patch("story_writer.writer.time.sleep") as wait:
+                story = generate_story(prepared, FakeProcessor(), object(), output)
+            self.assertEqual(call.call_count, 3)
+            wait.assert_called_once_with(5)
+            self.assertIn("still bad", call.call_args_list[2].args[2])
+            self.assertEqual(len(story["segments"]), 1)
+            progress = json.loads((output / "Example Manga_story_progress.json").read_text())
+            self.assertTrue(progress["complete"])
+            self.assertEqual([c["status"] for c in progress["chunks"]], ["failed", "complete"])
+
+    def test_persistent_invalid_panel_stops_with_checkpoint_and_raw_failures(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            manga, chapters, output = _fixture(Path(temporary))
+            prepared = prepare_story(manga, chapters, output)
+            with patch("story_writer.writer.generate_response", return_value=("not json", {"truncated": False})) as call, \
+                 patch("story_writer.writer.time.sleep"), patch("config.STORY_MAX_PANEL_FAILURES", 2):
+                with self.assertRaisesRegex(RuntimeError, "failed 2 retry cycles"):
+                    generate_story(prepared, FakeProcessor(), object(), output)
+            self.assertEqual(call.call_count, 4)
+            progress = json.loads((output / "Example Manga_story_progress.json").read_text(encoding="utf-8"))
+            self.assertFalse(progress["complete"])
+            self.assertEqual(len(progress["chunks"]), 2)
+            self.assertTrue(all(Path(a["raw_response"]).exists() for c in progress["chunks"] for a in c["attempts"]))
+            self.assertFalse((output / "Example Manga_story.json").exists())
+
+    def test_longer_segments_are_accepted_without_changing_prompt_target(self):
+        panel = {"panel_id": "p1", "characters": []}
+        for count in (57, 95, 150, 151):
+            with self.subTest(count=count):
+                raw = json.dumps({"segments": [{
+                    "primary_panel_id": "p1", "supporting_panel_ids": ["p1"],
+                    "text": " ".join(["word"] * count), "used_instance_ids": [], "name_uses": [],
+                }]})
+                _, errors = validate_story_response(raw, [panel])
+                self.assertEqual(bool(errors), count > 150)
+        from story_writer.writer import SYSTEM_PROMPT
+        self.assertIn("Keep each segment under 50 words", SYSTEM_PROMPT)
+
+    def test_failed_multi_panel_chunk_splits_and_finishes(self):
         with tempfile.TemporaryDirectory() as temporary:
             manga, chapters, output = _fixture(Path(temporary))
             prepared = prepare_story(manga, chapters, output)
@@ -547,19 +1143,29 @@ class StoryWriterTests(unittest.TestCase):
             prepared["panels"].append(second)
             generation = {"input_tokens": 100, "generated_tokens": 2,
                           "token_limit": 768, "truncated": False}
+            def generate(processor, model, prompt, *, max_new_tokens, response_schema):
+                variants = [variant for variant in response_schema["properties"]["segments"]["items"]["anyOf"]
+                            if "narration_policy" not in variant["properties"]]
+                if len(variants) > 1:
+                    return "not json", generation
+                panel_id = variants[0]["properties"]["primary_panel_id"]["enum"][0]
+                return json.dumps({"segments": [{
+                    "primary_panel_id": panel_id, "supporting_panel_ids": [panel_id],
+                    "text": "A door opens.", "used_instance_ids": [], "name_uses": [],
+                }]}), generation
+
             with patch(
                 "story_writer.writer.generate_response",
-                return_value=("not json", generation),
-            ) as call:
-                with self.assertRaisesRegex(ValueError, "no failure-splitting"):
-                    generate_story(prepared, FakeProcessor(), object(), output)
-            self.assertEqual(call.call_count, 2)
+                side_effect=generate,
+            ) as call, patch("config.STORY_CHUNK_MAX_PANELS", 2):
+                story = generate_story(prepared, FakeProcessor(), object(), output)
+            self.assertEqual(call.call_count, 4)
             progress = json.loads(
                 (output / "Example Manga_story_progress.json").read_text(encoding="utf-8")
             )
-            self.assertEqual(len(progress["chunks"]), 1)
+            self.assertEqual(len(progress["chunks"]), 3)
             self.assertEqual(progress["chunks"][0]["status"], "failed")
-            self.assertEqual(progress["segments"], [])
+            self.assertEqual([s["primary_panel_id"] for s in story["segments"]], ["panel_test_1", "panel_test_2"])
 
     def test_failure_saves_completed_prefix_and_resume_does_not_regenerate_it(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -579,8 +1185,8 @@ class StoryWriterTests(unittest.TestCase):
             with patch("config.STORY_CHUNK_MAX_PANELS", 1), \
                     patch("story_writer.writer.generate_response", side_effect=[
                         (response("panel_test_1"), metrics), ("not json", metrics), ("not json", metrics),
-                    ]):
-                with self.assertRaisesRegex(ValueError, "no failure-splitting"):
+                    ]), patch("story_writer.writer.time.sleep", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
                     generate_story(prepared, FakeProcessor(), object(), output)
             progress = json.loads((output / "Example Manga_story_progress.json").read_text(encoding="utf-8"))
             self.assertEqual(progress["completed_panel_ids"], ["panel_test_1"])
@@ -625,7 +1231,8 @@ class StoryWriterTests(unittest.TestCase):
             "allowed_name": None,
         }]) for index in range(10)]
         prompt = build_story_prompt([dict(base, panel_id="current")], completed_panels=old,
-                                    previous_narration="", tokenizer=FakeTokenizer())
+                                    previous_narration="An earlier capsule machine scene must not leak here.", tokenizer=FakeTokenizer())
+        self.assertNotIn("An earlier capsule machine scene", prompt)
         self.assertNotIn("old_instance_0", prompt)
         self.assertNotIn("old_instance_9", prompt)
         self.assertIn('"count":10', prompt)
@@ -757,7 +1364,8 @@ class StoryWriterTests(unittest.TestCase):
                     "used_instance_ids": [], "name_uses": [],
                 } for panel_id in ids]}), {"truncated": False, "generated_tokens": 80}
 
-            with patch("story_writer.writer.generate_response", side_effect=generate) as call:
+            with patch("story_writer.writer.generate_response", side_effect=generate) as call, \
+                    patch("config.STORY_CHUNK_MAX_PANELS", 2):
                 story = generate_story(prepared, FakeProcessor(), object(), output)
             self.assertEqual(call.call_count, 2)
             self.assertEqual(attempts, [["panel_test_1", "panel_test_2"]] * 2)
@@ -772,8 +1380,8 @@ class StoryWriterTests(unittest.TestCase):
             prepared = prepare_story(manga, chapters, output)
             with patch("story_writer.writer.generate_response", side_effect=[
                 ("truncated", {"truncated": True}), ("invalid", {"truncated": False}),
-            ]) as call:
-                with self.assertRaisesRegex(ValueError, "no failure-splitting"):
+            ]) as call, patch("story_writer.writer.time.sleep", side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
                     generate_story(prepared, FakeProcessor(), object(), output)
             self.assertEqual(call.call_count, 2)
             self.assertEqual(call.call_args_list[1].kwargs["max_new_tokens"],

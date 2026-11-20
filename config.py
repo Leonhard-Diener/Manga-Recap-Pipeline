@@ -4,6 +4,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 INPUT_DIR = BASE_DIR / "input"
 OUTPUT_DIR = BASE_DIR / "output"
+STORY_MAX_PANEL_FAILURES = 4  # At most eight requests per failing single panel per invocation.
 MODEL_PATH = BASE_DIR / "models" / "model.onnx"
 
 # RT-DETRv4-X Manga109-s inference.
@@ -206,12 +207,13 @@ STORY_SECONDS_PER_PANEL = 10
 STORY_SINGLE_REQUEST_TOKENS = 6_000
 STORY_CHUNK_TARGET_TOKENS = 4_500
 STORY_CHUNK_HARD_TOKENS = 6_000
-# Small local writers must not attempt a chapter-sized response before splitting.
-STORY_CHUNK_MAX_PANELS = 4
+# Live 4B probes mixed dialogue between panels in multi-panel requests.
+STORY_CHUNK_MAX_PANELS = 1
 STORY_CONTEXT_WORDS = 320
 STORY_ENABLE_THINKING = False
 # Input and generated output share the model context window.  Keep explicit
 # output/syntax headroom instead of treating the input limit as total capacity.
 STORY_CONTEXT_TOKEN_BUDGET = 8_192
+STORY_GPU_LAYERS = 24  # Leave VRAM headroom for desktop use on the 8GB GTX 1080.
 STORY_OUTPUT_HEADROOM_TOKENS = 512
 STORY_MAX_OUTPUT_TOKENS = 2_048

@@ -8,73 +8,112 @@ import json
 from pathlib import Path
 import re
 import tempfile
+import time
 
 import config
 from common.json_io import write_json
+from common.progress import show_progress
 from common.utils import natural_sort_key
 from description.quality import text_issues
 from story_entities.manifest import file_hash
 from story_entities.matching import stable_id
 
 
-PROMPT_VERSION = "grounded_story_writer_v10_story_text_scope"
+PROMPT_VERSION = "grounded_story_writer_v37_quoted_name_boundaries"
 STORY_SCHEMA_VERSION = 1
+SPEECH_VERBS = (
+    r"(?:says?|said|speaks?|shouts?|yells?|warns?|asks?|repl(?:y|ies)|responds?|remarks?|"
+    r"adds?|exclaims?|mutters?|whispers?|notes?|declares?|swears?|vows?|promises?|"
+    r"announces?|explains?|insists?|admits?|agrees?|answers?|demands?|calls?|cries|"
+    r"screams?|tells?|retorts?|protests?|reassures?|repeats?|recounts?|continues?|pleads?|begs?)\b"
+)
+ANONYMOUS_SPEECH = (
+    r"(?:someone(?:\s+else)?|somebody|a\s+voice|another\s+voice)"
+    r"(?:\s+(?:[\w-]+ly|nearby|off[- ]?screen|elsewhere|then|still|also))*\s+" + SPEECH_VERBS
+)
+SOURCE_COMMENTARY = re.compile(
+    r"\b(?:unattributed|narration captions?|narrative captions?)\b"
+    r"|\b(?:a|an|the)\s+(?:shot|panel|image|picture|close[- ]up)\s+(?:shows?|displays?|depicts?|reveals?|captures?)\b"
+    r"|\b(?:a|an|the)\s+(?:shot|close[- ]up)\s+of\b"
+    r"|\b(?:a|another|the)\s+view\s+of\b"
+    r"|\b(?:the\s+)?scene\s+(?:shows?|displays?|depicts?|reveals?|shifts?|changes?|cuts?)\b"
+    r"|\b(?:anonymous|unknown|unidentified)\s+(?:voice|speaker|warning|exclamation)\b"
+    r"|\b(?:titles?|signs?|captions?|lettering|speech bubbles?)\s+(?:(?:above|below|nearby|overhead|on[- ]screen)\s+)*(?:says?|reads?|states?|declares?|proclaims?|hails?|identifies?|describes?|explains?)\b"
+    r"|\b(?:text|dialogue|narration)\s+(?:reads?|states?|declares?|identifies?|describes?|explains?|includes?)\b"
+    r"|\b(?:a|the)\s+sign\s+(?:reads?|states?|declares?)\b"
+    r"|\b(?:exclamation|warning|dialogue|text)\s+(?:appears?|is shown|is displayed)\b"
+    r"|\bsound effects?\b",
+    re.IGNORECASE,
+)
 
 SYSTEM_PROMPT = """\
-Write an English YouTube manga recap using only the supplied accepted facts.
-Use natural third-person present tense and make consecutive panel segments read
-like one uninterrupted story. Never invent dialogue, motives, relationships,
-names, identities, actions, or transformations. Pending information is absent
-on purpose and must not be reconstructed. A proper name may be used only for
-the exact instance whose allowed_name contains that name. Otherwise use its
-neutral visible reference. allowed_reference is an appearance hint, not mandatory
-wording or an identity: a camera close-up is not a separate character, and a
-temporary pose is not a name. Equal non-null entity_id values are accepted identity
-continuity; visual_group_id alone is only a proposal and never proves identity.
-Do not address the audience or speak in first person as the narrator. Prefer
-short third-person indirect speech. Brief quotations of supplied dialogue are
-allowed when clearly attributed; their pronouns do not change narrator perspective.
-For example, change "YOU BROKE THE RULE" to "He accuses the other student of
-breaking the rule" rather than copying the whole exchange. Do not laboriously
-announce isolated words with phrases like "utters the words"; describe visible
-reactions instead when the dialogue fragment adds no clear meaning. Describe only the current panel,
-never recap the previous-narration context in a new segment.
+Write a continuous spoken story using only the supplied accepted facts, in order.
+Tell the story in natural third-person present tense, not a list of visible things.
+Lead with the situation and stakes when supplied, then follow action, reaction,
+and consequence. Connect related beats with ordinary transitions like "but",
+"then", and "instead" only when their relationship is supported. Keep meaningful
+dialogue and reveals; do not substitute a description of the speaker's appearance.
+Do not mention every person or every visual change. Write complete sentences,
+vary their length, and make the segments sound like one continuous paragraph.
+Describe what changes or matters, not what the drawing contains.
+Write one or two connected, complete sentences about the main action, reaction,
+or speech. Use roughly 95% he/she or permitted-name references when grounded.
+Establish a subject, then prefer pronouns. A brief reference like "the blonde girl
+screams" is enough when needed to disambiguate. Do not inventory hair, clothing,
+body parts, poses, backgrounds, or every drawn figure. Omit incidental details.
+If visual_hold_allowed is true and there is no new meaningful story beat, return
+text "" and narration_policy "visual_hold_v1", with empty used_instance_ids and
+name_uses. That panel remains visible without a forced caption. Never use a hold
+to omit supplied speech, narration, an accepted action, or a transformation.
+Otherwise use a short true sentence, not padding or an invented event.
+When visual_hold_required is true, return the silent hold, not a visual caption.
+Keep each segment under 50 words. Preserve meaningful warnings, threats, setups,
+contrasts, reveals, punchlines, and brief interjections. Join related facts without
+inventing causes, motives, dialogue, relationships, identity, or transformations.
 
-Return one compact JSON object and nothing else. It must contain segments in
-the exact supplied panel order. Every segment requires:
-- primary_panel_id: the corresponding input panel ID
-- supporting_panel_ids: existing supplied panel IDs, including the primary ID
-- text: concise narration supported by the available facts; sparse panels may
-   be shorter than the normal 12-45 word target. Never pad a short observation.
-   Keep each segment under 50 words. For evidence_density uncertain,
-  state only that the visual details are unclear and do not reconstruct them
-- used_instance_ids: exact supplied instance IDs mentioned or clearly referred to
-- name_uses: [] when no permitted proper name is used; otherwise objects with
-  name and instance_id for each permitted proper name actually in the narration.
-  Never emit an empty object or empty name/instance strings.
+Evidence and references:
+- story_context supplies narration. Start with its key story point, retell it
+  directly, and preserve meaningful introductions/background. Do not announce captions.
+  Convert first-person narrator context to third person without guessing who "I"
+  refers to. If identity is not grounded, preserve only the supported neutral content.
+- Descriptions support visible observations. Bind accepted_actions and
+  accepted_transformations only to their supplied endpoints. Pending facts are absent
+  on purpose. A transcribed claim is speech/thought, not necessarily a true event.
+- Use only the exact occurrence's allowed_name. These are neutral aliases, not manga
+  names. Do not adopt names from dialogue or introduce "a boy named". Use an alias
+  once per segment; withheld aliases must not be reconstructed. allowed_reference is
+  a hint, not mandatory wording. He/she needs clear evidence, never an alias or title.
+  A demon king need not be male. If gender is unclear, use a short neutral reference.
+- Equal non-null entity_id establishes continuity; visual_group_id alone does not.
+  Repeated views with the same alias are not extra people. Never invent "another [alias]".
+  reference_context is continuity help, not new events or permission to repeat prose.
+- Remove camera framing, drawing-scale wording, effect commentary, meaningless glyphs,
+  and publication material. Do not invent an in-world cause for drawn effects.
+  Distant people are not miniature people. If evidence_density is uncertain, say only
+  that details are unclear. Narrate only this panel, never earlier or later events.
 
-Cover every supplied panel exactly once. Do not repeat context narration from a
-previous chunk. Descriptions are visible observations; accepted_actions and
-accepted_transformations are the only actor-specific/event-specific facts that
-may be stated with certainty. If attribution remains unclear, use neutral visual
-wording rather than choosing a character. Accepted text facts are transcriptions,
-not proof that a character's statement is true. Summarize them as attributed
-indirect speech, thought, or narration; their claims must not be converted into
-objective story facts.
+Speech:
+- A non-null speaker_instance_id assigns that exact line to that occurrence.
+  Use its speaker_reference, preferably he/she when clear, or its permitted name.
+  Do not replace a known speaker with someone. Prefer concise indirect speech.
+- anonymous_dialogue has NO known speaker: prefer a standalone exact quotation
+  in double quotes, without "someone says/asks" or any guessed character attribution.
+  A quotation can stand alone, e.g. "Pardon?" Keep brief interjections verbatim.
+  Never guess a visible character, even if only one is drawn or a nearby line has a
+  known speaker. Do not infer a shout from plain speech or an audible voice from a thought.
+  Omit unknown-speaker thoughts. Do not move speech between panels or give one speaker
+  the entire exchange. Do not merge an unknown line into "he adds/she notes".
+  First-person words inside source quotations do not change narrator perspective.
 
-Tell the scene, not an inventory of images or lettering. Use story narration to
-preserve setups, contrasts, reveals and punchlines; do not replace those with
-"text reads" or "dialogue includes" lists. Publication text is excluded from the
-story input. Sound effects are context only: describe a supported sound or impact
-naturally rather than reading out Japanese glyphs or inventing their cause.
-Each dialogue/thought fact has its own speaker_instance_id. Only a non-null value
-permits attribution to that exact occurrence. unattributed_speech has NO known
-speaker: retain meaningful content as an unattributed warning/comment, or omit a
-fragment, but NEVER turn it into a visible character's speech or thoughts. Being
-the only visible character, appearing in the same panel, or speaking an adjacent
-line is not evidence of authorship. Do not assign one speaker to an entire exchange.
-Do not move dialogue to a neighboring panel to manufacture an attribution.
-Narrator captions are not a visible character's speech or private thoughts.
+Return one compact JSON object with segments in exactly the requested panel order.
+Cover every panel once. Each segment contains:
+- primary_panel_id: exact current ID
+- supporting_panel_ids: supplied IDs including the primary ID, never future evidence
+- text: the narration, with no audience address or source/presentation commentary
+- used_instance_ids: exact supplied occurrences actually referred to
+- name_uses: [] or {name, instance_id} entries only for permitted names actually spoken
+For an allowed silent panel only, also include narration_policy: "visual_hold_v1".
+No empty names/IDs, invented IDs, or extra fields.
 """
 
 
@@ -123,15 +162,10 @@ def _safe_reference(description: str | None) -> str | None:
 
 
 def _character_fact(row: dict) -> dict:
-    reviewed_name = row.get("name") if row.get("naming_allowed") else None
-    identity_confirmed = row.get("identity_status") in {
-        "accepted", "reviewed", "confirmed", "accepted_reviewed",
-    }
-    fallback_name = (
+    allowed_name = (
         row.get("display_name")
-        if row.get("display_name_allowed") and identity_confirmed else None
+        if row.get("display_name_allowed") else None
     )
-    allowed_name = reviewed_name or fallback_name
     description = row.get("stable_description") or row.get("visual_description")
     reference = allowed_name or _safe_reference(description) or "an unidentified character"
     return {
@@ -152,13 +186,6 @@ def _is_narration_eligible(row: dict) -> bool:
     return row.get("narration_eligibility", "eligible") in {
         "eligible", "eligible_automatic", "reviewed_eligible",
     }
-
-
-def _event_reference(event: dict, prefix: str) -> str | None:
-    name = event.get(prefix + "_display_name")
-    if isinstance(name, str) and name.strip():
-        return name.strip()
-    return _safe_reference(event.get(prefix + "_description"))
 
 
 def prepare_story(manga_dir: Path, chapters: list[Path], output_root: Path) -> dict:
@@ -286,12 +313,10 @@ def prepare_story(manga_dir: Path, chapters: list[Path], output_root: Path) -> d
             "event_id": event.get("event_id"),
             "text": event.get("text"),
             "actor_instance_id": actor_id,
-            "actor_reference": _event_reference(event, "actor")
-                               or _character_fact(characters_by_id[actor_id])["allowed_reference"],
+            "actor_reference": _character_fact(characters_by_id[actor_id])["allowed_reference"],
             "target_instance_id": target_id,
-            "target_reference": (_event_reference(event, "target")
-                                 or (_character_fact(characters_by_id[target_id])["allowed_reference"]
-                                     if target_id else None)),
+            "target_reference": (_character_fact(characters_by_id[target_id])["allowed_reference"]
+                                 if target_id else None),
             "acceptance_policy": event.get("acceptance_policy"),
         })
 
@@ -350,7 +375,10 @@ def prepare_story(manga_dir: Path, chapters: list[Path], output_root: Path) -> d
             page_name = Path(page.get("page", "")).name
             filter_record = chapter_filter.get(page_name)
             if not isinstance(filter_record, dict):
-                raise ValueError(f"Missing story-page decision: {chapter.name}/{page_name}")
+                raise ValueError(
+                    f"Missing story-page decision: {chapter.name}/{page_name}. "
+                    "Resume main.py with --start-at description to complete page analysis first."
+                )
             if (filter_record.get("source_hash") != page.get("source_hash")
                     or filter_record.get("geometry_revision") != page.get("geometry_revision")
                     or filter_record.get("grounding_revision") != page.get("grounding_revision")):
@@ -622,6 +650,7 @@ def prepare_story(manga_dir: Path, chapters: list[Path], output_root: Path) -> d
     fingerprint_payload = {
         "inputs": input_files,
         "identity_revision": classification.get("revision"),
+        "canonical_names": sorted({row["name"] for row in classification.get("identities", []) if row.get("name")}),
         "prompt_version": PROMPT_VERSION,
         "settings": settings,
     }
@@ -634,6 +663,7 @@ def prepare_story(manga_dir: Path, chapters: list[Path], output_root: Path) -> d
         )),
         "identity_revision": classification.get("revision"),
         "input_files": input_files,
+        "canonical_names": fingerprint_payload["canonical_names"],
         "settings": settings,
         "input_fingerprint": _stable_hash(fingerprint_payload),
         "model_version": Path(config.STORY_MODEL_PATH).name,
@@ -641,38 +671,198 @@ def prepare_story(manga_dir: Path, chapters: list[Path], output_root: Path) -> d
     }
 
 
-def _panel_prompt_record(panel: dict) -> dict:
-    facts = panel.get("accepted_text_facts", [])
+def _narrative_observation(text: str) -> str:
+    """Remove explicit drawing conventions only from temporary writer input."""
+    text = re.sub(r"\b(?:small|smaller|tiny|miniature)\s+version\s+of\s+(?:a|the)\s+(?=character\b)",
+                  "", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"\b(?:small|smaller|tiny)\s+(?=group\s+of\s+(?:people|characters|figures|students)\b)",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:another\s+(?:full[- ]body\s+)?view\s+of\s+the\s+same\s+character)[^.!?]*[.!?]?",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:amidst|amid|among|with|and|surrounded by)\s+"
+        r"(?:(?:electrical|lightning|impact|visual|drawing|motion|speed)\s+(?:and\s+)?)+effects?"
+        r"(?:\s+around\s+(?:them|him|her))?",
+        "", text, flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"\b(?:small|smaller|tiny|miniature)\s+(?=(?:people|characters?|figures?|students?|boys?|girls?|men|women)\b)",
+        "", text, flags=re.IGNORECASE,
+    )
+    return " ".join(text.split())
+
+
+def _brief_appearance(description: str | None) -> str:
+    description = description or ""
+    if re.search(r"\b(?:group|people|characters|figures|students|boys|girls|men|women)\b", description, re.IGNORECASE):
+        return "the group"
+    role = re.search(r"\b(?:girl|woman|boy|man|maid|creature|child|student|guard|knight|soldier|person|character)\b",
+                     description, re.IGNORECASE)
+    noun = role.group().lower() if role else "character"
+    trait = ""
+    hair = re.search(r"\b(dark|black|white|light)(?:[- ]haired|\s+(?:\w+\s+){0,2}hair)\b", description, re.IGNORECASE)
+    if re.search(r"\bblond(?:e)?\b", description, re.IGNORECASE):
+        trait = "blonde "
+    elif hair:
+        trait = hair[1].lower() + "-haired "
+    elif re.search(r"\b(?:horns|horned)\b", description, re.IGNORECASE):
+        trait = "horned "
+    return "the " + trait + noun
+
+
+def _brief_character_reference(character: dict, panel: dict) -> str:
+    reference = character.get("allowed_reference")
+    if reference in {"he", "she"}:
+        return reference
+    description = character.get("visual_description") or ""
+    if _brief_appearance(description) == "the group":
+        return "the group"
+    female = bool(re.search(r"\b(?:female|woman|girl|she|her)\b", description, re.IGNORECASE))
+    male = bool(re.search(r"\b(?:male|man|boy|he|him|his)\b", description, re.IGNORECASE))
+    if not female and not male and len(panel["characters"]) == 1:
+        female = bool(re.search(r"\b(?:female|woman|girl|she|her)\b", panel.get("description", ""), re.IGNORECASE))
+        male = bool(re.search(r"\b(?:male|man|boy|he|him|his)\b", panel.get("description", ""), re.IGNORECASE))
+    return "she" if female and not male else "he" if male and not female else _brief_appearance(description)
+
+
+def _panel_prompt_record(panel: dict, canonical_names: list[str] | None = None) -> dict:
+    facts = []
+    characters = {c["instance_id"]: c for c in panel["characters"]}
+    def event_references(event):
+        event = dict(event)
+        for endpoint in ("actor", "target", "source"):
+            character = characters.get(event.get(endpoint + "_instance_id"))
+            if character:
+                event[endpoint + "_reference"] = character.get("allowed_name") or _brief_character_reference(character, panel)
+        return event
+    for original in panel.get("accepted_text_facts", []):
+        fact = dict(original)
+        speaker = characters.get(fact.get("speaker_instance_id"))
+        if speaker and fact["kind"] in {"dialogue", "thought"}:
+            fact["speaker_reference"] = _brief_character_reference(speaker, panel)
+        elif fact["kind"] == "dialogue" and fact.get("speaker_instance_id") is None:
+            fact["speaker_reference"] = None
+        for name in canonical_names or []:
+            introduction = re.fullmatch(rf"\s*I\s+AM\s+{re.escape(name)}\s*,?\s*(.*?)\s*",
+                                        fact["text"], flags=re.IGNORECASE)
+            if not introduction or fact["kind"] != "dialogue":
+                continue
+            alias = characters.get(fact.get("speaker_instance_id"), {}).get("allowed_name")
+            if alias:
+                fact["text"] = re.sub(rf"\b{re.escape(name)}\b", lambda _: alias, fact["text"], flags=re.IGNORECASE)
+            elif introduction[1].strip(" .!?,"):
+                fact["text"] = "I am " + introduction[1].lstrip(", ")
+            else:
+                fact["text"] = "The speaker introduces themself."
+        facts.append(fact)
     return {
         "chapter": panel["chapter"],
         "page": panel["page"],
         "panel_number": panel["panel_number"],
         "panel_id": panel["panel_id"],
-        "description": panel["description"],
-        "characters": panel["characters"],
-        "accepted_actions": panel["accepted_actions"],
-        "accepted_transformations": panel["accepted_transformations"],
+        "story_context": [fact["text"] for fact in facts if fact["kind"] == "narration"],
+        "description": _narrative_observation(panel["description"]),
+        "characters": [dict(character,
+                            visual_description=_brief_appearance(character.get("visual_description")),
+                            allowed_reference=character.get("allowed_name") or _brief_character_reference(character, panel),
+                            **{key: stable_id("reference_", key, character[key]) if character.get(key) else None
+              for key in ("entity_id", "form_id")}) for character in panel["characters"]],
+        "accepted_actions": [event_references(event) for event in panel["accepted_actions"]],
+        "accepted_transformations": [event_references(event) for event in panel["accepted_transformations"]],
         "accepted_text_facts": [fact for fact in facts
-                                if fact["kind"] not in {"publication", "sound_effect"}
-                                and not (fact["kind"] in {"dialogue", "thought"}
-                                         and fact.get("speaker_instance_id") is None)],
-        "unattributed_speech": [fact for fact in facts
-                                if fact["kind"] in {"dialogue", "thought"}
-                                and fact.get("speaker_instance_id") is None],
-        "sound_effects_context_only": [fact for fact in facts if fact["kind"] == "sound_effect"],
+                                 if fact["kind"] not in {"publication", "sound_effect", "narration"}
+                                 and not (fact["kind"] in {"dialogue", "thought"}
+                                          and fact.get("speaker_instance_id") is None)],
+        "anonymous_dialogue": [fact for fact in facts
+                                 if fact["kind"] == "dialogue"
+                                 and fact.get("speaker_instance_id") is None],
         "evidence_density": panel.get("evidence_density", "ordinary"),
+        "visual_hold_allowed": _visual_hold_allowed(panel),
+        "visual_hold_required": _static_visual_hold(panel),
     }
+
+
+def _visual_hold_allowed(panel: dict) -> bool:
+    """No accepted story event or meaningful text may disappear into a visual hold."""
+    return (panel.get("evidence_density", "ordinary") != "uncertain"
+            and not panel.get("reviewed_narration")
+            and not panel.get("accepted_actions") and not panel.get("accepted_transformations")
+            and not any(fact.get("kind") not in {"publication", "sound_effect"}
+                        for fact in panel.get("accepted_text_facts", [])))
+
+
+def _static_visual_hold(panel: dict) -> bool:
+    """Only explicit static fragments, never a repair for missing action/speech evidence."""
+    # shortcut: three observed static forms only; replace with reviewed scene beats for broader selection.
+    return _visual_hold_allowed(panel) and bool(re.fullmatch(
+        r"(?:lower body and legs of a person standing|"
+        r"a character standing in a doorway(?: in the background)?|"
+        r"a close[- ]up(?: view)? of (?:blond(?:e)?|dark|light|black|white)(?:[- ]haired)? hair)\.?",
+        panel.get("description", "").strip(), flags=re.IGNORECASE,
+    ))
+
+
+def _reference_panels(panels: list[dict], previous_segments: list[dict] | None = None,
+                      *, suppress_names: bool = False) -> list[dict]:
+    """Withhold recently spoken aliases from both the prompt and output schema."""
+    recent_names = {use["name"] for segment in (previous_segments or [])[-2:]
+                    for use in segment.get("name_uses", [])}
+    replacements = {}
+    for panel in panels:
+        for character in panel["characters"]:
+            name = character.get("allowed_name")
+            if not name or not (suppress_names or name in recent_names):
+                continue
+            replacements[name] = _brief_character_reference(character, panel)
+
+    def rewrite(value):
+        if isinstance(value, dict):
+            return {key: (None if key == "allowed_name" and item in replacements else rewrite(item))
+                    for key, item in value.items()}
+        if isinstance(value, list):
+            return [rewrite(item) for item in value]
+        if isinstance(value, str):
+            for name, reference in replacements.items():
+                value = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", lambda _: reference, value, flags=re.IGNORECASE)
+        return value
+
+    return rewrite(panels)
 
 
 def build_story_prompt(
     panels: list[dict], *, outline: str = "", character_guide: list[dict] | None = None,
     completed_panels: list[dict], previous_narration: str, tokenizer,
+    previous_segments: list[dict] | None = None,
+    suppress_names: bool = False,
+    canonical_names: list[str] | None = None,
 ) -> str:
+    panels = _reference_panels(panels, previous_segments, suppress_names=suppress_names)
     covered = [panel["panel_id"] for panel in completed_panels]
+    current_aliases = {c.get("allowed_name") for panel in panels for c in panel["characters"]} - {None}
+    earlier_characters = {
+        c["instance_id"]: c for panel in completed_panels for c in panel["characters"]
+    }
+    last_subjects = {
+        earlier_characters[instance_id].get("allowed_name")
+        for instance_id in ((previous_segments or [{}])[-1].get("used_instance_ids", []))
+        if instance_id in earlier_characters
+    }
     context = {
         "covered_panels": {"count": len(covered), "rule": "Already committed; do not generate them again."},
-        "previous_narration_context_only_do_not_repeat": previous_narration,
-        "next_panels": [_panel_prompt_record(panel) for panel in panels],
+        "reference_context": {
+            "previously_used_aliases": sorted({
+                use["name"] for segment in previous_segments or []
+                for use in segment.get("name_uses", []) if use["name"] in current_aliases
+            }),
+            "last_unambiguous_subject": (next(iter(last_subjects))
+                                         if len(last_subjects) == 1 and last_subjects <= current_aliases else None),
+        },
+        # Previous prose was copied into unrelated panels; accepted IDs carry continuity instead.
+        "next_panels": [_panel_prompt_record(panel, canonical_names) for panel in panels],
     }
     contract = {
         "segments": [{
@@ -711,9 +901,13 @@ def validate_story_response(
     *,
     known_names: set[str] | None = None,
     supporting_panels: list[dict] | None = None,
+    previous_segments: list[dict] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Validate panel coverage, references, names and basic narration constraints."""
     errors = []
+    previous_texts = {}
+    for row in previous_segments or []:
+        previous_texts.setdefault(tuple(_words(row["text"].casefold())), []).append(row.get("primary_panel_id"))
     try:
         payload = _extract_json(raw)
     except (ValueError, TypeError, json.JSONDecodeError) as error:
@@ -754,6 +948,14 @@ def validate_story_response(
         supporting = segment.get("supporting_panel_ids")
         used_instances = segment.get("used_instance_ids")
         name_uses = segment.get("name_uses")
+        if segment.get("narration_policy") is not None:
+            from story_writer.display import is_visual_hold
+            if (is_visual_hold(segment) and primary in panel_by_id
+                    and _visual_hold_allowed(panel_by_id[primary]) and supporting == [primary]):
+                normalized.append({key: segment[key] for key in (
+                    "primary_panel_id", "supporting_panel_ids", "text", "used_instance_ids", "name_uses", "narration_policy")})
+                continue
+            errors.append(f"Segment {index + 1} has an invalid visual hold; accepted story facts must be narrated.")
         if not isinstance(text, str) or not text.strip():
             errors.append(f"Segment {index + 1} has no narration text.")
             continue
@@ -767,8 +969,114 @@ def validate_story_response(
             if not accepted_fallback:
                 errors.append(f"Segment {index + 1} does not match its accepted fallback evidence.")
         count = len(_words(text))
-        if not accepted_fallback and (count < 3 or count > 55):
-            errors.append(f"Segment {index + 1} has {count} words; expected a concise panel segment.")
+        current_panel = panel_by_id.get(primary, {})
+        if _static_visual_hold(current_panel):
+            errors.append(f"Segment {index + 1} is a static detail panel; use its required visual hold instead of a caption.")
+        dialogue = [fact for fact in current_panel.get("accepted_text_facts", []) if fact["kind"] == "dialogue"]
+        unknown_lines = {tuple(_words(fact["text"].casefold().replace("’", "'"))) for fact in dialogue
+                         if fact.get("speaker_instance_id") is None and _words(fact["text"])}
+        standalone_quotes = {tuple(_words(match[1].casefold().replace("’", "'"))) for match in re.finditer(
+            r'(?:^|(?<=[.!?]["”])\s+|(?<=[.!?])\s+)["“]([^"”]+)["”](?=$|\s+[A-Z“"])', text,
+        )}
+        quoted_unknown = bool(unknown_lines) and unknown_lines <= standalone_quotes
+        anonymous_speech = re.search(
+            r"\b" + ANONYMOUS_SPEECH,
+            text, re.IGNORECASE,
+        )
+        if (any(fact.get("speaker_instance_id") is None and _words(fact["text"]) for fact in dialogue)
+                and not anonymous_speech and not quoted_unknown):
+            errors.append(
+                f"Segment {index + 1} does not keep unknown dialogue explicitly anonymous. "
+                "Keep that unknown line as a standalone exact quotation in double quotes without a speaker tag; "
+                "never merge it into a known speaker's speech."
+            )
+        if dialogue and all(fact.get("speaker_instance_id") is not None for fact in dialogue):
+            anonymous_speech = re.search(
+                r"(?:^|[.!?]\s+)" + ANONYMOUS_SPEECH,
+                text, re.IGNORECASE,
+            )
+            if anonymous_speech:
+                errors.append(
+                    f"Segment {index + 1} anonymizes known speech. All dialogue here has a supplied speaker; "
+                    "use the corresponding he/she or neutral speaker reference, not someone else."
+                )
+        for fact in current_panel.get("accepted_text_facts", []):
+            if fact["kind"] != "dialogue" or fact.get("speaker_instance_id") is not None:
+                continue
+            interjection = re.fullmatch(r"\s*([A-Za-z]+)\s*[!?]+\s*", fact["text"])
+            if interjection and not re.search(rf"\b{re.escape(interjection[1])}\b", text, re.IGNORECASE):
+                errors.append(
+                    f"Segment {index + 1} omits brief anonymous dialogue {fact['text']!r}. "
+                    "Keep it as a short anonymous quotation in this panel; "
+                    "do not move it or assign a visible speaker."
+                )
+        matching_panels = previous_texts.get(tuple(_words(text.casefold())), [])
+        description = " ".join(current_panel.get("description", "").split()).casefold()
+        same_description = description and any(
+            description == " ".join(panel_by_id.get(panel_id, {}).get("description", "").split()).casefold()
+            for panel_id in matching_panels
+        )
+        if count >= 12 and matching_panels and not same_description:
+            errors.append(
+                f"Segment {index + 1} repeats previously completed narration verbatim. "
+                "Narrate only this panel's supplied facts, not the previous-narration context."
+            )
+        presentation = None
+        for candidate in SOURCE_COMMENTARY.finditer(text):
+            physical_sign = re.fullmatch(r"(?:(?:a|the)\s+)?sign\s+reads?", candidate.group(), re.IGNORECASE)
+            grounded_sign = physical_sign and any(
+                fact["kind"] == "sign" and fact["text"].strip()
+                and re.match(r"\s*[:,'\"“‘]*\s*" + re.escape(fact["text"].strip()) + r"(?!\w)",
+                             text[candidate.end():], flags=re.IGNORECASE)
+                for fact in current_panel.get("accepted_text_facts", [])
+            )
+            if not grounded_sign:
+                presentation = candidate
+                break
+        if presentation:
+            errors.append(
+                f"Segment {index + 1}: {presentation.group()!r} reports source presentation. "
+                "Remove the framing or attribution label and retain the subject and content directly; "
+                "keep unknown speech as an unassigned quotation. Do not invent or omit story facts."
+            )
+        if re.search(r"\b(?:close[- ]up view|in profile|(?:legs|body parts) (?:are )?visible|caption box (?:says|declares)|story reveals)\b", text, re.IGNORECASE):
+            errors.append(f"Segment {index + 1} reports camera framing or source presentation; narrate the story beat, or use an allowed visual hold.")
+        if re.search(r"\b(?:camera (?:focuses|shows)|(?:speaks|stands) against a .* background)\b", text, re.IGNORECASE):
+            errors.append(f"Segment {index + 1} reports camera framing or source presentation; keep the event, not its background.")
+        from story_writer.evidence import outside_quotations
+        narrator_text, quote_errors = outside_quotations(text)
+        errors.extend(f"Segment {index + 1}: {error}" for error in quote_errors)
+        if re.search(r"\b(?:I|we|our|ours)\b", narrator_text, re.IGNORECASE):
+            errors.append(f"Segment {index + 1} uses first-person narration outside quotations; retell narrator context in third person without guessing an identity.")
+        style_error = re.search(
+            r"\b(?:small|tiny|miniature)\s+(?:people|characters?|figures?|students?|boys?|girls?|men|women)\b"
+            r"|\b(?:boy|girl|man|woman|person|character|student)\s+(?:named|called)\b"
+            r"|\b(?:lightning|impact|electrical|visual|drawing|motion|speed)\s+effects?\b",
+            text, re.IGNORECASE,
+        )
+        if style_error:
+            errors.append(
+                f"Segment {index + 1}: {style_error.group()!r} uses drawing-scale, effects, or name-introduction wording. "
+                "Use the alias directly, omit drawing effects, and call distant people people in the background."
+            )
+        for name in {c.get("allowed_name") for c in current_panel.get("characters", [])} - {None}:
+            occurrences = re.findall(rf"(?<!\w){re.escape(name)}(?!\w)", narrator_text, re.IGNORECASE)
+            recent_names = {use["name"] for segment in ((previous_segments or []) + normalized)[-2:]
+                            for use in segment.get("name_uses", [])}
+            if len(occurrences) > 1 or (occurrences and name in recent_names):
+                errors.append(
+                    f"Segment {index + 1} violates name-frequency limits: one use per alias per segment, "
+                    "then two segments without that alias. Use clear pronouns or supplied visual references."
+                )
+            # A busy exchange may need repeated names; style alone must not deadlock generation.
+            if re.search(rf"\banother\s+{re.escape(name)}\b", text, re.IGNORECASE):
+                errors.append(
+                    f"Segment {index + 1} repeats or duplicates alias {name!r}. "
+                    "Describe the character once; prefer clear pronouns after establishing the subject."
+                )
+        short_unknown_quote = quoted_unknown and re.fullmatch(r'["“][^"”]+["”]', text.strip())
+        if not accepted_fallback and ((count < 3 and not short_unknown_quote) or count > 150):
+            errors.append(f"Segment {index + 1} has {count} words; allowed range is 3-150 words.")
         if (not isinstance(supporting, list) or primary not in supporting
                 or len(supporting) != len(set(supporting))
                 or any(panel_id not in panel_by_id for panel_id in supporting)):
@@ -805,14 +1113,24 @@ def validate_story_response(
                     or fact is None or fact.get("allowed_name") != name):
                 errors.append(f"Segment {index + 1} uses an unapproved name.")
                 continue
-            if not re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, flags=re.IGNORECASE):
+            if not re.search(rf"(?<!\w){re.escape(name)}(?!\w)", narrator_text, flags=re.IGNORECASE):
                 errors.append(f"Segment {index + 1} declares a name that is not in its text.")
                 continue
             declared_names.append(name)
+        source_speech = {tuple(_words(f["text"].casefold().replace("’", "'")))
+                         for f in current_panel.get("accepted_text_facts", [])
+                         if f["kind"] in {"dialogue", "thought"}}
+        quotations = [next(part for part in quote.groups() if part is not None)
+                      for quote in re.finditer(r'"([^"]+)"|“([^”]+)”|(?<!\w)\'(.*?)\'(?!\w)', text, re.DOTALL)]
         for name in all_allowed_names:
-            if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", text, flags=re.IGNORECASE):
+            if re.search(rf"(?<!\w){re.escape(name)}(?!\w)", narrator_text, flags=re.IGNORECASE):
                 if not any(name.casefold() == declared.casefold() for declared in declared_names):
                     errors.append(f"Segment {index + 1} does not ground the name {name!r}.")
+            else:
+                for quoted in quotations:
+                    if (re.search(rf"(?<!\w){re.escape(name)}(?!\w)", quoted, re.IGNORECASE)
+                            and tuple(_words(quoted.casefold().replace("’", "'"))) not in source_speech):
+                        errors.append(f"Segment {index + 1} uses name {name!r} in a quotation not supported by exact source speech.")
         normalized.append({
             "primary_panel_id": primary,
             "supporting_panel_ids": supporting,
@@ -827,7 +1145,8 @@ def _token_count(tokenizer, text: str) -> int:
     return len(tokenizer.encode(text, add_special_tokens=False))
 
 
-def _story_response_schema(panels: list[dict]) -> dict:
+def _story_response_schema(panels: list[dict], previous_segments: list[dict] | None = None,
+                           *, suppress_names: bool = False) -> dict:
     """Constrain syntax, output count, and exact ID vocabulary, not narration."""
     def references(values):
         values = sorted(set(values))
@@ -837,6 +1156,7 @@ def _story_response_schema(panels: list[dict]) -> dict:
             "items": {"type": "string", "enum": values or [""]},
         }
 
+    panels = _reference_panels(panels, previous_segments, suppress_names=suppress_names)
     variants = []
     for panel in panels:
         characters = panel["characters"]
@@ -861,6 +1181,20 @@ def _story_response_schema(panels: list[dict]) -> dict:
             "additionalProperties": False,
         }
         variants.append(segment)
+        if _static_visual_hold(panel):
+            variants.pop()
+        if _visual_hold_allowed(panel):
+            variants.append({
+                "type": "object", "properties": {
+                    "primary_panel_id": {"type": "string", "enum": [panel["panel_id"]]},
+                    "supporting_panel_ids": segment["properties"]["supporting_panel_ids"],
+                    "text": {"type": "string", "enum": [""]},
+                    "used_instance_ids": {"type": "array", "maxItems": 0, "items": {"type": "string"}},
+                    "name_uses": {"type": "array", "maxItems": 0, "items": {"type": "object"}},
+                    "narration_policy": {"type": "string", "enum": ["visual_hold_v1"]},
+                }, "required": ["primary_panel_id", "supporting_panel_ids", "text", "used_instance_ids", "name_uses", "narration_policy"],
+                "additionalProperties": False,
+            })
     return {
         "type": "object", "properties": {
             "segments": {"type": "array", "items": {"anyOf": variants},
@@ -925,6 +1259,7 @@ def _initial_chunks(prepared: dict, tokenizer, completed_panels: list[dict]) -> 
     )
     full_input = _token_count(tokenizer, full_prompt)
     if (not completed_panels and len(remaining) <= config.STORY_CHUNK_MAX_PANELS
+            and len({(panel["chapter"], panel["page"]) for panel in remaining}) == 1
             and _request_fits(full_input, _output_token_budget(tokenizer, remaining), single=True)):
         return [remaining]
 
@@ -941,6 +1276,7 @@ def _initial_chunks(prepared: dict, tokenizer, completed_panels: list[dict]) -> 
         output_tokens = _output_token_budget(tokenizer, candidate)
         if current and (
             len(candidate) > config.STORY_CHUNK_MAX_PANELS
+            or (panel["chapter"], panel["page"]) != (current[0]["chapter"], current[0]["page"])
             or input_tokens > config.STORY_CHUNK_TARGET_TOKENS
             or not _request_fits(input_tokens, output_tokens)
         ):
@@ -1022,7 +1358,7 @@ def _load_progress(path: Path, prepared: dict, *, restart: bool) -> dict:
             _, errors = validate_story_response(
                 json.dumps({"segments": segments}, ensure_ascii=False),
                 prepared["panels"][:len(covered)],
-                known_names={
+                known_names=set(prepared.get("canonical_names", [])) | {
                     row["allowed_name"] for row in prepared["character_guide"]
                     if row.get("allowed_name")
                 },
@@ -1062,13 +1398,20 @@ def _boundary_edit(segments: list[dict]) -> list[dict]:
 
 
 def _timeline(segments: list[dict], panel_lookup: dict[str, dict], wpm: int) -> list[dict]:
+    from story_writer.display import VISUAL_HOLD_SECONDS, is_visual_hold, narration_blocks
     timeline = []
     word_cursor = 0
     seconds_cursor = 0.0
     words_per_second = wpm / 60
-    for segment in segments:
+    scene_durations = {}
+    for block in narration_blocks(segments):
+        if segments[block[-1]].get("scene_panel_ids") is not None:
+            duration = len(_words(segments[block[-1]]["text"])) / words_per_second
+            scene_durations.update({index: duration / len(block) for index in block})
+    for index, segment in enumerate(segments):
         count = len(_words(segment["text"]))
-        duration = count / words_per_second if words_per_second else 0
+        duration = VISUAL_HOLD_SECONDS if is_visual_hold(segment) else count / words_per_second if words_per_second else 0
+        duration = scene_durations.get(index, duration)
         panel = panel_lookup[segment["primary_panel_id"]]
         timeline.append({
             "panel_id": segment["primary_panel_id"],
@@ -1086,6 +1429,8 @@ def _timeline(segments: list[dict], panel_lookup: dict[str, dict], wpm: int) -> 
 
 
 def _publish(prepared: dict, progress: dict, output_root: Path) -> dict:
+    from story_writer.display import DISPLAY_POLICY, build_display_groups
+
     panel_lookup = {panel["panel_id"]: panel for panel in prepared["panels"]}
     segments = _boundary_edit(progress["segments"])
     published_segments = []
@@ -1100,7 +1445,7 @@ def _publish(prepared: dict, progress: dict, output_root: Path) -> dict:
             word_count=len(_words(segment["text"])),
         )
         published_segments.append(row)
-    narration = " ".join(segment["text"] for segment in published_segments).strip()
+    narration = " ".join(segment["text"] for segment in published_segments if segment["text"]).strip()
     metadata = {
         "input_files": prepared["input_files"],
         "input_fingerprint": prepared["input_fingerprint"],
@@ -1112,8 +1457,11 @@ def _publish(prepared: dict, progress: dict, output_root: Path) -> dict:
         "generation_settings": prepared["settings"],
         "run_id": progress["run_id"],
         "boundary_edit_policy": "verbatim_model_text_v2",
+        "narration_mode": prepared.get("narration_mode", "panel"),
         "resumed_from_prompt_version": progress.get("resumed_from_prompt_version"),
     }
+    if "quality_checks" in progress:
+        metadata["quality_checks"] = progress["quality_checks"]
     story = {
         "schema_version": STORY_SCHEMA_VERSION,
         "manga": prepared["manga"],
@@ -1127,6 +1475,8 @@ def _publish(prepared: dict, progress: dict, output_root: Path) -> dict:
         "timeline": _timeline(published_segments, panel_lookup, config.STORY_NARRATION_WPM),
         "metadata": metadata,
     }
+    timeline["display_groups"] = build_display_groups(published_segments, timeline["timeline"])
+    timeline["display_policy"] = DISPLAY_POLICY
     text_path = output_root / f"{prepared['manga']}_story.txt"
     story_path = output_root / f"{prepared['manga']}_story.json"
     timeline_path = output_root / f"{prepared['manga']}_panel_timeline.json"
@@ -1153,6 +1503,7 @@ def generate_story(prepared: dict, processor, model, output_root: Path, *, resta
     panel_lookup = {panel["panel_id"]: panel for panel in prepared["panels"]}
     completed_panels = [panel_lookup[panel_id] for panel_id in progress["completed_panel_ids"]]
     total_panels = len(prepared["panels"])
+    show_progress("Story panels", len(completed_panels), total_panels)
     print(
         f"Story progress: {len(completed_panels)}/{total_panels} panels "
         f"({len(completed_panels) / total_panels:.0%})",
@@ -1162,6 +1513,11 @@ def generate_story(prepared: dict, processor, model, output_root: Path, *, resta
     debug_dir = output_root / prepared["manga"] / "story_runs" / progress["run_id"]
     debug_dir.mkdir(parents=True, exist_ok=True)
     chunk_number = len(progress["chunks"])
+    retry_feedback = {}
+    panel_failures = {}
+    name_suppressed_chunks = set()
+    effect_cleaned_chunks = set()
+    anonymous_repair_chunks = set()
 
     while chunks:
         chunk = chunks.pop(0)
@@ -1171,6 +1527,8 @@ def generate_story(prepared: dict, processor, model, output_root: Path, *, resta
             completed_panels=completed_panels,
             previous_narration=previous,
             tokenizer=processor.tokenizer,
+            previous_segments=progress["segments"],
+            canonical_names=prepared.get("canonical_names"),
         )
         input_tokens = _token_count(processor.tokenizer, prompt)
         whole_story_request = (
@@ -1203,8 +1561,10 @@ def generate_story(prepared: dict, processor, model, output_root: Path, *, resta
         accepted_segments = None
         attempt_records = []
         validation_errors = []
-        response_schema = _story_response_schema(chunk)
+        response_schema = _story_response_schema(chunk, progress["segments"])
         raw = ""
+        chunk_key = tuple(panel["panel_id"] for panel in chunk)
+        previous_failure = retry_feedback.pop(chunk_key, None)
         for attempt in (1, 2):
             print(
                 f"  Generating chunk {chunk_number}, attempt {attempt}/2: "
@@ -1212,14 +1572,99 @@ def generate_story(prepared: dict, processor, model, output_root: Path, *, resta
                 flush=True,
             )
             attempt_prompt = prompt
-            if attempt == 2:
+            failure_errors = validation_errors if attempt == 2 else (previous_failure or (None, []))[1]
+            if any("name-frequency" in error or "declares a name that is not in its text" in error
+                   for error in failure_errors):
+                name_suppressed_chunks.add(chunk_key)
+            if any("sound effect" in error and "reports source presentation" in error for error in failure_errors):
+                effect_cleaned_chunks.add(chunk_key)
+            if any("unknown dialogue explicitly anonymous" in error or "omits brief anonymous dialogue" in error
+                   for error in failure_errors):
+                anonymous_repair_chunks.add(chunk_key)
+            if (chunk_key in name_suppressed_chunks or chunk_key in effect_cleaned_chunks
+                    or chunk_key in anonymous_repair_chunks):
+                # Do not reintroduce withheld names through the failed response or its schema.
+                retry_chunk = chunk
+                if chunk_key in effect_cleaned_chunks:
+                    retry_chunk = [dict(panel, description=re.sub(
+                        r"\s+(?:and|with)\s+(?:(?:a|an|the)\s+)?sound effects?(?=[.!?](?:\s|$)|$)",
+                        "", panel["description"], flags=re.IGNORECASE,
+                    )) for panel in chunk]
+                suppress_names = chunk_key in name_suppressed_chunks
+                attempt_prompt = build_story_prompt(
+                    retry_chunk, completed_panels=completed_panels, previous_narration="",
+                    previous_segments=progress["segments"], tokenizer=processor.tokenizer, suppress_names=suppress_names,
+                    canonical_names=prepared.get("canonical_names"),
+                )
+                response_schema = _story_response_schema(chunk, progress["segments"], suppress_names=suppress_names)
+                if failure_errors:
+                    feedback = json.dumps(failure_errors, ensure_ascii=False)
+                    hidden_names = (set(prepared.get("canonical_names", [])) | {
+                        row["allowed_name"] for row in prepared["character_guide"] if row.get("allowed_name")
+                    }) if suppress_names else set()
+                    for name in sorted(hidden_names, key=len, reverse=True):
+                        feedback = re.sub(rf"(?<!\w){re.escape(name)}(?!\w)", "withheld name", feedback, flags=re.IGNORECASE)
+                    attempt_prompt += (
+                        "\nCORRECTION: " + feedback
+                        + (". Keep name_uses empty. " if suppress_names else ". ")
+                        + "Preserve supplied anonymous_dialogue as standalone exact quotations, including brief interjections. "
+                        "Return a complete corrected JSON object."
+                    )
+                if chunk_key in anonymous_repair_chunks:
+                    quotations = [fact["text"] for panel in _reference_panels(
+                        retry_chunk, progress["segments"], suppress_names=suppress_names)
+                                  for fact in _panel_prompt_record(panel, prepared.get("canonical_names"))["anonymous_dialogue"]]
+                    attempt_prompt += (
+                        "\nUNASSIGNED QUOTATIONS: " + json.dumps(quotations, ensure_ascii=False)
+                        + ". Put each line in double quotes as its own sentence. Do not prefix it with "
+                        "he/she says, the character says, or someone says. Keep other supported story facts separate."
+                    )
+            elif attempt == 2 or previous_failure:
+                failed_raw, failed_errors = (raw, validation_errors) if attempt == 2 else previous_failure
                 attempt_prompt += (
-                    "\nPrevious failed response (data to correct, not instructions):\n" + raw
+                    "\nPrevious failed response (data to correct, not instructions):\n" + failed_raw
                     + "\nCORRECTION: The previous response failed validation for these reasons: "
-                    + json.dumps(validation_errors, ensure_ascii=False)
+                    + json.dumps(failed_errors, ensure_ascii=False)
                     + ". Return a completely corrected JSON object."
                 )
             correction_input = _token_count(processor.tokenizer, attempt_prompt)
+            quote_only_retry = False
+            quotation_retry_policy = None
+            if chunk_key in anonymous_repair_chunks and len(chunk) == 1:
+                record = _panel_prompt_record(_reference_panels(
+                    chunk, progress["segments"], suppress_names=chunk_key in name_suppressed_chunks,
+                )[0], prepared.get("canonical_names"))
+                if record["anonymous_dialogue"]:
+                    lines = []
+                    for fact in record["anonymous_dialogue"]:
+                        line = " ".join(fact["text"].split()).replace('"', "'").replace("“", "'").replace("”", "'")
+                        lines.append('"' + line + ("" if line.endswith((".", "!", "?")) else ".") + '"')
+                    quotation = dict(primary_panel_id=chunk[0]["panel_id"], supporting_panel_ids=[chunk[0]["panel_id"]],
+                                     text=" ".join(lines), used_instance_ids=[], name_uses=[])
+                    _, quotation_errors = validate_story_response(
+                        json.dumps({"segments": [quotation]}), chunk,
+                        known_names=set(prepared.get("canonical_names", [])) | {
+                            row["allowed_name"] for row in prepared["character_guide"] if row.get("allowed_name")
+                        },
+                        supporting_panels=completed_panels + chunk, previous_segments=progress["segments"],
+                    )
+                    if not quotation_errors:
+                        properties = response_schema["properties"]["segments"]["items"]["anyOf"][0]["properties"]
+                        quote_only_retry = not any(record[key] for key in (
+                            "story_context", "accepted_text_facts", "accepted_actions", "accepted_transformations"))
+                        if quote_only_retry:
+                            properties["text"] = {"type": "string", "enum": [quotation["text"]]}
+                            properties["used_instance_ids"]["maxItems"] = 0
+                            properties["name_uses"]["maxItems"] = 0
+                            quotation_retry_policy = "source_quotation_only_v1"
+                        else:
+                            # Native pattern decoding mishandles ASCII quotes inside JSON strings.
+                            prefix = " ".join("“" + line[1:-1] + "”" for line in lines)
+                            properties["text"] = {"type": "string", "maxLength": 800,
+                                                  "pattern": "^" + re.escape(prefix).replace(r"\ ", " ") + r'( [A-Z][^"\\\n\r]*)?$'}
+                            quotation_retry_policy = "source_quotation_prefix_v1"
+                            attempt_prompt += "\nBegin with the unassigned quotations, then continue with the supported actions and known speech."
+                            correction_input = _token_count(processor.tokenizer, attempt_prompt)
             if not _request_fits(correction_input, max_new_tokens, single=whole_story_request):
                 validation_errors = ["Correction prompt exceeds the combined context budget."]
                 break
@@ -1243,17 +1688,19 @@ def generate_story(prepared: dict, processor, model, output_root: Path, *, resta
             segments, validation_errors = validate_story_response(
                 raw,
                 chunk,
-                known_names={
+                known_names=set(prepared.get("canonical_names", [])) | {
                     row["allowed_name"] for row in prepared["character_guide"]
                     if row.get("allowed_name")
                 },
                 supporting_panels=completed_panels + chunk,
+                previous_segments=progress["segments"],
             )
             if generation.get("truncated"):
                 validation_errors.append("Generation reached its token limit.")
             attempt_records.append({
                 "attempt": attempt,
                 "raw_response": str(raw_path.resolve()),
+                "repair_policy": quotation_retry_policy,
                 "generation": generation,
                 "validation_errors": list(validation_errors),
             })
@@ -1281,11 +1728,26 @@ def generate_story(prepared: dict, processor, model, output_root: Path, *, resta
                 "reason": list(validation_errors),
             })
             write_json(progress_path, progress)
-            raise ValueError(
-                f"Story chunk {chunk_number} failed after {len(attempt_records)} attempts; "
-                "progress saved, no failure-splitting or automatic fallback. "
-                + "; ".join(validation_errors[:3])
-            )
+            if len(chunk) > 1:
+                midpoint = len(chunk) // 2
+                chunks[0:0] = [chunk[:midpoint], chunk[midpoint:]]
+                print(f"    Chunk {chunk_number} failed; progress saved. Retrying as smaller chunks.", flush=True)
+            else:
+                panel_id = chunk[0]["panel_id"]
+                panel_failures[panel_id] = panel_failures.get(panel_id, 0) + 1
+                if panel_failures[panel_id] >= config.STORY_MAX_PANEL_FAILURES:
+                    raise RuntimeError(
+                        f"Panel {panel_id} failed {panel_failures[panel_id]} retry cycles. "
+                        f"Progress and failed responses retained: {progress_path}. "
+                        f"Last errors: {'; '.join(validation_errors[:2])}. "
+                        "Resolve the reported validation errors before resuming."
+                    )
+                if "Correction prompt exceeds the combined context budget." not in validation_errors:
+                    retry_feedback[(chunk[0]["panel_id"],)] = (raw, validation_errors)
+                chunks.insert(0, chunk)
+                print(f"    Panel still failed validation; progress saved. Retrying in 5 seconds (Ctrl+C to stop).", flush=True)
+                time.sleep(5)
+            continue
 
         for segment in accepted_segments:
             segment["generation_chunk"] = chunk_number
@@ -1301,6 +1763,7 @@ def generate_story(prepared: dict, processor, model, output_root: Path, *, resta
             })
         completed_panels.extend(chunk)
         write_json(progress_path, progress)
+        show_progress("Story panels", len(completed_panels), total_panels)
         print(
             f"    Completed {len(completed_panels)}/{total_panels} panels "
             f"({len(completed_panels) / total_panels:.0%})",
@@ -1320,11 +1783,14 @@ def run_story_writer(
     output_root: Path,
     *,
     restart: bool = False,
+    narration_style: str = "panel",
 ) -> dict:
+    if narration_style not in {"panel", "scene"}:
+        raise ValueError("narration_style must be panel or scene.")
     print("Preparing grounded story evidence...", flush=True)
     prepared = prepare_story(manga_dir, chapters, output_root)
     progress_path = output_root / f"{prepared['manga']}_story_progress.json"
-    if progress_path.is_file() and not restart:
+    if narration_style == "panel" and progress_path.is_file() and not restart:
         progress = _load_progress(progress_path, prepared, restart=False)
         if progress.get("complete"):
             print("Story is already complete; restoring published files.", flush=True)
@@ -1335,6 +1801,9 @@ def run_story_writer(
     processor, model = load_story_model()
     print("Story model ready.", flush=True)
     try:
+        if narration_style == "scene":
+            from story_writer.scenes import generate_scene_story
+            return generate_scene_story(prepared, processor, model, output_root, restart=restart)
         return generate_story(prepared, processor, model, output_root, restart=restart)
     finally:
         model.close()

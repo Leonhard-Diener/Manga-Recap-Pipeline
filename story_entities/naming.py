@@ -1,4 +1,4 @@
-"""Stable gender-neutral display names for retained visual groups."""
+"""Stable gender-neutral narration aliases, independent of canonical names."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ def _ranked_names(names: list[str], manga: str, subject_id: str) -> list[str]:
 
 
 def assign_group_display_names(result: dict, manga: str) -> None:
-    """Name retained groups, sharing one name across accepted entity forms."""
+    """Name only retained ReID groups, sharing aliases across accepted forms."""
     groups = sorted(result.get("visual_groups", []), key=lambda row: row["group_id"])
     characters = {
         row["instance_id"]: row
@@ -48,9 +48,9 @@ def assign_group_display_names(result: dict, manga: str) -> None:
             characters[instance_id].get("entity_id")
             for instance_id in group.get("instance_ids", [])
             if instance_id in characters
-            and characters[instance_id].get("entity_id") is not None
         }
-        if len(entity_ids) == 1:
+        # One accepted occurrence must not rename an otherwise unresolved group.
+        if len(entity_ids) == 1 and None not in entity_ids:
             group_subjects[group["group_id"]] = ("entity", entity_ids.pop())
         else:
             group_subjects[group["group_id"]] = ("visual_group", group["group_id"])
@@ -59,7 +59,7 @@ def assign_group_display_names(result: dict, manga: str) -> None:
     names = load_fallback_names()
     if len(subjects) > len(names):
         raise ValueError(
-            f"{len(subjects)} retained characters exceed the {len(names)}-name fallback pool."
+            f"{len(subjects)} alias subjects exceed the {len(names)}-name fallback pool."
         )
 
     used: set[str] = set()
@@ -72,12 +72,10 @@ def assign_group_display_names(result: dict, manga: str) -> None:
         used.add(selected.casefold())
         subject_names[subject] = selected
 
-    assigned: dict[str, tuple[str, str]] = {}
     for group in groups:
         group_id = group["group_id"]
         subject = group_subjects[group_id]
         selected = subject_names[subject]
-        assigned[group_id] = (selected, subject[0])
         group.update(
             display_name=selected,
             display_name_source="fallback_pool",
@@ -85,20 +83,17 @@ def assign_group_display_names(result: dict, manga: str) -> None:
         )
 
     for character in result.get("characters", []):
-        assignment = assigned.get(character.get("visual_group_id"))
-        if assignment is None:
-            character.pop("display_name", None)
-            character.pop("display_name_allowed", None)
-            character.pop("display_name_source", None)
-            character.pop("display_name_scope", None)
-            character.pop("name_evidence_ids", None)
+        subject = group_subjects.get(character.get("visual_group_id"))
+        if subject is None:
+            for key in ("display_name", "display_name_allowed", "display_name_source",
+                        "display_name_scope", "name_evidence_ids"):
+                character.pop(key, None)
             continue
-        selected, scope = assignment
         character.update(
-            display_name=selected,
+            display_name=subject_names[subject],
             display_name_allowed=True,
             display_name_source="fallback_pool",
-            display_name_scope=scope,
+            display_name_scope=subject[0],
             name_evidence_ids=[],
         )
 
@@ -113,7 +108,7 @@ def assign_group_display_names(result: dict, manga: str) -> None:
             )
 
     result["display_naming_policy"] = {
-        "rule_version": "stable_gender_neutral_surname_pool_v2",
+        "rule_version": "retained_reid_gender_neutral_aliases_v6",
         "fallback_pool_size": len(names),
         "pool_kind": "common_japanese_surnames",
         "ungrouped_characters_named": False,

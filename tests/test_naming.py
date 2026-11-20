@@ -112,6 +112,60 @@ class FallbackNamingTests(unittest.TestCase):
             source["visual_groups"][1]["display_name"],
         )
 
+    def test_one_accepted_member_cannot_give_two_unresolved_groups_the_same_alias(self):
+        source = {
+            "visual_groups": [{"group_id": g, "instance_ids": [g + "1", g + "2"]}
+                              for g in ("girl", "boy")],
+            "characters": [{"instance_id": g + str(i), "visual_group_id": g,
+                            "entity_id": "shared" if i == 1 else None}
+                           for g in ("girl", "boy") for i in (1, 2)],
+        }
+        assign_group_display_names(source, "Manga")
+        self.assertNotEqual(source["visual_groups"][0]["display_name"],
+                            source["visual_groups"][1]["display_name"])
+
+    def test_aliases_do_not_require_canonical_names_or_name_reveals(self):
+        from story_writer.writer import _character_fact
+
+        source = {
+            "visual_groups": [{"group_id": "group", "instance_ids": ["before", "after"]}],
+            "identities": [{"entity_id": "lucia", "name": "Lucia",
+                            "name_record": {"source_instance_id": "after"}}],
+            "characters": [
+                {"instance_id": instance, "visual_group_id": "group", "entity_id": "lucia",
+                 "identity_status": "reviewed", "naming_allowed": allowed,
+                 "name": "Lucia" if allowed else None, "stable_description": "a horned girl"}
+                for instance, allowed in (("before", False), ("after", True))
+            ],
+        }
+        assign_group_display_names(source, "Manga")
+        before, after = source["characters"]
+        self.assertTrue(before["display_name_allowed"])
+        self.assertEqual(_character_fact(before)["allowed_name"], before["display_name"])
+        self.assertEqual(_character_fact(after)["allowed_name"], before["display_name"])
+        self.assertNotEqual(_character_fact(after)["allowed_name"], "Lucia")
+
+    def test_unretained_occurrences_stay_unnamed_even_with_an_entity_or_stale_alias(self):
+        from story_writer.writer import _character_fact
+
+        source = {
+            "visual_groups": [{"group_id": "retained", "instance_ids": ["person"]}],
+            "characters": [
+                {"instance_id": "person", "visual_group_id": "retained", "identity_status": "unknown"},
+                {"instance_id": "solo", "visual_group_id": None, "entity_id": "hero",
+                 "display_name": "Stale", "display_name_allowed": True},
+                {"instance_id": "removed", "visual_group_id": "filtered_out",
+                 "display_name": "Stale", "display_name_allowed": True},
+            ],
+        }
+        assign_group_display_names(source, "Manga")
+        person, solo, removed = source["characters"]
+        self.assertEqual(_character_fact(person)["allowed_name"], person["display_name"])
+        self.assertEqual(person["identity_status"], "unknown")
+        for row in (solo, removed):
+            self.assertNotIn("display_name", row)
+            self.assertIsNone(_character_fact(row)["allowed_name"])
+
 
 if __name__ == "__main__":
     unittest.main()

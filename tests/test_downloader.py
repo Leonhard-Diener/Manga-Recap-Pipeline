@@ -7,6 +7,7 @@ import unittest
 from unittest.mock import patch
 
 import httpx
+from unittest.mock import AsyncMock
 
 from downloader import download_chapter as downloader
 
@@ -20,6 +21,49 @@ class _FakeClient:
 
 
 class DownloadSchedulingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_at_home_persistent_rate_limit_is_bounded(self):
+        response = httpx.Response(429, request=httpx.Request("GET", "https://api.mangadex.org"),
+                                  headers={"X-RateLimit-Retry-After": "inf"})
+        client = AsyncMock()
+        client.get.return_value = response
+        with patch.object(downloader.asyncio, "sleep") as sleep, self.assertRaises(httpx.HTTPStatusError):
+            await downloader._get_at_home_server(client, "id", downloader._IntervalLimiter(0))
+        self.assertEqual(client.get.await_count, 5)
+        self.assertTrue(all(0 <= c.args[0] <= 300 for c in sleep.call_args_list))
+
+    async def test_chapter_missing_pages_fails_instead_of_reporting_success(self):
+        data = {"baseUrl": "https://example.com", "chapter": {"hash": "h", "data": ["page.jpg"]}}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(downloader.config, "INPUT_DIR", tmp), \
+             patch.object(downloader, "_get_at_home_server", return_value=data), \
+             patch.object(downloader, "_download_image", return_value=False), \
+             self.assertRaisesRegex(RuntimeError, "1 pages failed"):
+            await downloader._download_chapter_with_client("id", "Manga", 1, AsyncMock(),
+                asyncio.Semaphore(1), downloader._IntervalLimiter(0), downloader._SharedCooldown())
+
+    async def test_chapter_progress_counts_cached_pages_and_successes(self):
+        data = {"baseUrl": "https://example.com", "chapter": {"hash": "h", "data": ["one.jpg", "two.jpg"]}}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(downloader.config, "INPUT_DIR", tmp), \
+             patch.object(downloader, "_get_at_home_server", return_value=data), \
+             patch.object(downloader, "show_progress") as progress:
+            folder = os.path.join(tmp, "Manga", "chapter_001")
+            os.makedirs(folder)
+            downloader._write_file(os.path.join(folder, "00001.jpg"), b"cached")
+            client = AsyncMock()
+            client.get.return_value = httpx.Response(200, content=b"page")
+            count = await downloader._download_chapter_with_client("id", "Manga", 1, client,
+                asyncio.Semaphore(1), downloader._IntervalLimiter(0), downloader._SharedCooldown())
+            self.assertEqual(count, 2)
+            self.assertEqual(progress.call_args.args[1:], (2, 2))
+            self.assertEqual(client.get.await_count, 1)
+            self.assertFalse(any(name.endswith(".part") for name in os.listdir(folder)))
+
+    async def test_failed_file_write_does_not_publish_partial_page(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "page.jpg")
+            with patch.object(downloader.os, "replace", side_effect=OSError("disk failure")), self.assertRaises(OSError):
+                downloader._write_file(path, b"image")
+            self.assertEqual(os.listdir(tmp), [])
+
     async def test_chapters_share_limits_and_only_four_run_at_once(self):
         active = 0
         maximum_active = 0

@@ -18,6 +18,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 import config
 from common.json_io import write_json
+from common.progress import show_progress
 from common.model_loading import configure_windows_safetensors_loader
 from common.utils import list_images, move_to_device
 from description.format import FormatResponseError, parse_json, validate_format, validate_grounding
@@ -85,13 +86,17 @@ def _remote_result(client, image_path, prompt, schema, token_limit, *, _repair=F
     except (TypeError, ValueError) as error:
         if _repair:
             raise FormatResponseError(f"Invalid model response after one format repair: {error}", [raw]) from error
+        repair_limit = token_limit
+        if completion.get("finish_reason") == "length":
+            # Include the provider's thinking allowance when growing a truncated repair.
+            repair_limit += int(completion.get("token_limit") or token_limit)
         try:
             repaired = _remote_result(
                 client, image_path,
                 prompt + f"\nThe previous response failed validation: {error}\n"
                 "Return the complete requested JSON with this error corrected. "
                 "Keep descriptions grounded in the image; do not guess a replacement label.",
-                schema, token_limit, _repair=True, character_labels=character_labels,
+                schema, repair_limit, _repair=True, character_labels=character_labels,
                 role_only=role_only,
             )
         except FormatResponseError as failure:
@@ -1434,9 +1439,12 @@ def describe_chapter(
     transformations: dict[str, dict] = dict(resume_result.get("transformations", {}))
     page_filter: dict[str, dict] = dict(resume_result.get("page_filter", {}))
     completed_pages = set(transformations)
+    progress_label = f"Descriptions {chapter_output_dir.name}"
+    show_progress(progress_label, len(completed_pages), len(pages))
     pending_pages = []
 
     def current_result() -> dict:
+        show_progress(progress_label, len(transformations), len(pages))
         value = {
             "descriptions": results,
             "transformations": transformations,
@@ -2070,6 +2078,8 @@ def describe_manga(
             })
         else:
             print("  Reusing current extraction checkpoint.", flush=True)
+            count = len(chapter["transformations"])
+            show_progress(f"Descriptions {chapter_dir.name} (cached)", count, count)
         all_results[chapter_dir.name] = chapter["descriptions"]
         if chapter.get("pending_pages"):
             unresolved[chapter_dir.name] = chapter["pending_pages"]

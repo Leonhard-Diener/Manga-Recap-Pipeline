@@ -17,6 +17,19 @@ The important design rule is that uncertainty is preserved. A visual group is no
 
 ## Current entry points and execution order
 
+`main.py ["Manga title"]` orchestrates panels, Gemini descriptions, ReID, story,
+and TTS/video through the existing runners in separate processes. `--download`
+adds the interactive MangaDex step; `--start-at <stage>` skips earlier stages.
+Gemini is the default; `--description-backend qwen` explicitly selects local
+descriptions. Stage failures stop the pipeline; logs live in
+`output/<manga>/pipeline_runs/<run>/`. Completion bars and retry messages remain
+visible. The default `--stall-timeout 1800` watchdog stops an owned stage tree
+after no progress (exit 124); retry logs do not reset description/story timers.
+The standalone writer bounds failed single-panel cycles via
+`config.STORY_MAX_PANEL_FAILURES`; local story HTTP retries and MangaDex rate-limit
+retries are bounded. Gemini's standalone transient retries remain unlimited.
+This adds no training-data export or identity/name extraction functionality.
+
 Use the standalone scripts in this order:
 
 1. `test_download.py ["Manga title"]` — optional MangaDex download into `input/<manga>/chapter_*/`.
@@ -28,6 +41,14 @@ Use the standalone scripts in this order:
 Files named `test_*.py` at the repository root are operational stage runners, not unit tests. Tests under `tests/` are the actual automated test suite.
 
 `old/main.py` is archived legacy code and is not the authoritative workflow. It still imports the removed `cleanup` package and only represents an older four-stage pipeline. Do not use it as the basis for new work unless the task explicitly includes repairing/replacing the legacy entry point.
+
+YouTube upload is opt-in via `main.py --upload` or `test_video.py --upload` after
+a successful render. `test_upload.py <exact.mp4> --title <title>` handles existing
+videos; `--dry-run` validates settings without auth/network. Edit
+`youtube_upload.json` (unlisted by default); setup and uncertain-upload recovery are
+in `YOUTUBE_UPLOAD.md`. OAuth secrets/tokens belong in gitignored `.secrets/`.
+Do not run real uploads or OAuth as a test. Sibling `.youtube.json` receipts must
+not be cleared automatically after an uncertain failure (duplicate-upload risk).
 
 ## Source and output layout
 
@@ -96,6 +117,13 @@ Panel geometry and reading order are upstream evidence. A description fix cannot
 - `response.py` — parses compact model JSON into the public schema, validates panel and label mappings, and fails closed on malformed/truncated evidence.
 - `quality.py` — semantic checks for fragments, placeholders, repeated descriptions, unusable appearances, and nonvisual/ungrounded actions.
 
+The Gemini runner retains partial exports but exits 2 when `pending_pages` remain,
+so the main pipeline stops before ReID/story. Resume at `--start-at description`;
+completed current page checkpoints remain reusable. The shared remote format
+repair remains bounded to one attempt, increasing its token allowance only after
+truncation (including the provider's reported thinking allowance). This changes
+failed-attempt recovery, not the acceptance policy for completed cached evidence.
+
 `C1`, `C2`, etc. are request-local labels, never names or global identities. Their `detection_id` is the durable bridge to ReID. Keep all public description/page-filter/transformation sections and stable mappings when refactoring; new status/provenance fields should normally be additive.
 
 ### Character identity stage: `story_entities/`
@@ -114,10 +142,20 @@ The normal primary encoder is DINOv3; CCIP can supply style-link evidence. ReID 
 ### Story stage: `story_writer/`
 
 - `writer.py` — validates all upstream files, joins panels/instances/events, builds prompts, validates model JSON, checkpoints chunks, resumes compatible runs, archives stale/restarted outputs, and publishes narration/timeline files.
+- `scenes.py` — default operational CLI style: one grounded paragraph per source
+  page, bounded repair, scene checkpoints, and expansion into complete panel
+  coverage. `--style panel` retains the older per-panel CLI mode; direct library
+  calls default to that older mode for compatibility.
 - `__init__.py` — public `run_story_writer` export.
 - `STORY_WRITER_SPEC.md` — intended evidence and output contract; check implementation/tests where the spec and current behavior differ.
 
 The writer is text-only and uses a private llama.cpp server with Qwen3.5-4B Q8_0 GGUF, independently of the description checkpoint. It must consume only current, accepted evidence, retain ordered panel coverage, enforce exact IDs/name permissions, and never silently publish a partial failed run.
+
+Scene coverage rows can have empty text with `scene_visual_v1` and a validated
+`narrated_by_panel_id`; their anchor owns the paragraph and `scene_panel_ids`.
+The video renderer synthesizes it once and shares actual audio duration across
+all same-page panels. Legacy `visual_hold_v1` rows are explicit short silent holds,
+not permission to accept arbitrary blank narration. Preserve these distinctions.
 
 ## Models and their roles
 

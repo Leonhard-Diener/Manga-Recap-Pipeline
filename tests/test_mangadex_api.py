@@ -1,6 +1,7 @@
 """Network-free tests for MangaDex API rate-limit handling."""
 
 import unittest
+import requests
 from unittest.mock import Mock, patch
 
 from downloader import mangadex_api
@@ -40,6 +41,18 @@ class MangaDexApiTests(unittest.TestCase):
             mangadex_api.USER_AGENT,
         )
         sleep.assert_any_call(1.0)
+
+    def test_persistent_rate_limit_stops_and_absurd_sleep_is_bounded(self):
+        limited = requests.Response()
+        limited.status_code = 429
+        limited.url = "https://api.mangadex.org/manga"
+        limited.headers["X-RateLimit-Retry-After"] = "inf"
+        with patch.object(mangadex_api.requests, "get", return_value=limited) as request, \
+             patch.object(mangadex_api.time, "sleep") as sleep, \
+             self.assertRaises(requests.HTTPError):
+            mangadex_api.get(limited.url)
+        self.assertEqual(request.call_count, 5)
+        self.assertTrue(all(0 <= c.args[0] <= 300 for c in sleep.call_args_list))
 
 
 if __name__ == "__main__":

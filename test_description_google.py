@@ -120,9 +120,14 @@ def main(argv: list[str] | None = None) -> dict:
     return result
 
 
+def cli(argv: list[str] | None = None) -> int:
+    result = main(argv)
+    return 2 if result.get("pending_pages") else 0
+
+
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(cli())
     except KeyboardInterrupt:
         raise SystemExit("Stopped by user. Rerun the same command to resume saved progress.") from None
     except (OSError, ValueError, RuntimeError) as error:

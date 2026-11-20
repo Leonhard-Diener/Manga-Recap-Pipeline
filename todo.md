@@ -1,4 +1,14 @@
-* check where the names should come from. currently they need to be added manually.  SOLUTION: Pick random gender neutral names
+# Planned training and identity work (not implemented)
+
+- [ ] Automatically collect training candidates on every run for character ReID: source/page/panel/detection IDs, original and contextual crops, representations, matching evidence, proposed identities, and corrections. Keep predictions separate from verified labels; do not train on unreviewed groups as ground truth.
+- [ ] Automatically collect Gemini input images/prompts, model/settings, raw responses, accepted structured outputs, failures, and corrections on every run for future Qwen fine-tuning. Preserve provenance and uncertainty; model acceptance is not a verified training label.
+- [ ] Fine-tune/evaluate a manga ReID model using the collected data, including chibi views, back views, lookalikes, toys, and illustrations. Split evaluation by manga to avoid train/test leakage.
+- [ ] Replace Gemini with a fine-tuned Qwen vision model once held-out evaluation supports it; no provider change yet.
+- [ ] Extract character names from the manga and ground each name to the correct character, retaining uncertainty. Current generated gender-neutral aliases remain the fallback until this is implemented.
+
+## Historical notes
+
+* Earlier naming solution: random gender-neutral aliases (superseded as the long-term goal by grounded manga-name extraction above).
 * fix how files select on which manga to run the script if multiple manga exist inside of input. SOLUTION: Takes the name inside of config (downloader also)
 * create the test_write_storry.py based on the .md file  DONE
 - optimize the result

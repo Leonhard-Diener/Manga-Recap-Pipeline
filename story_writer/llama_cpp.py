@@ -36,7 +36,7 @@ class LlamaCppWriter:
             self.process = subprocess.Popen([
                 str(executable), "--model", str(model), "--host", "127.0.0.1", "--port", str(port),
                 "--ctx-size", str(config.STORY_CONTEXT_TOKEN_BUDGET), "--parallel", "1",
-                "--n-gpu-layers", "99", "--jinja", "--reasoning", "off",
+                "--n-gpu-layers", str(config.STORY_GPU_LAYERS), "--jinja", "--reasoning", "off",
                 "--chat-template-kwargs", '{"enable_thinking":false}', "--no-warmup",
             ], stdout=self.log, stderr=subprocess.STDOUT)
             deadline = time.monotonic() + 180
@@ -68,10 +68,22 @@ class LlamaCppWriter:
             self.log.close()
 
     def _post(self, route, payload):
-        response = self.session.post(self.url + route, json=payload, timeout=(10, 600))
-        if not response.ok:
-            raise RuntimeError(f"llama.cpp HTTP {response.status_code}: {response.text[:1200]}")
-        return response.json()
+        for attempt in range(3):
+            try:
+                response = self.session.post(self.url + route, json=payload, timeout=(10, 600))
+            except (requests.Timeout, requests.ConnectionError) as error:
+                reason = type(error).__name__
+            else:
+                if response.ok:
+                    return response.json()
+                if response.status_code not in (408, 429, 500, 502, 503, 504):
+                    raise RuntimeError(f"llama.cpp HTTP {response.status_code}: {response.text[:1200]}")
+                reason = f"HTTP {response.status_code}"
+            process = getattr(self, "process", None)
+            if attempt == 2 or (process is not None and process.poll() is not None):
+                raise RuntimeError(f"llama.cpp {reason}; request failed after {attempt + 1} attempts.")
+            print(f"llama.cpp {reason}; waiting 10 seconds before retry {attempt + 2}/3 (Ctrl+C to stop).", flush=True)
+            time.sleep(10)
 
     @lru_cache(maxsize=128)
     def encode(self, text, add_special_tokens=False):
@@ -99,4 +111,5 @@ class LlamaCppWriter:
             "elapsed_seconds": round(elapsed, 3),
             "tokens_per_second": round(generated / elapsed, 2) if elapsed else 0.0,
             "timings": result.get("timings", {}), "backend": "llama.cpp",
+            "gpu_layers": config.STORY_GPU_LAYERS,
         }

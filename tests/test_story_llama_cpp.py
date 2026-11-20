@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 import unittest
 from unittest.mock import MagicMock, patch
+import requests
 
 from story_writer.llama_cpp import LlamaCppWriter
 
@@ -49,6 +50,17 @@ class LlamaCppTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "400.*Unsupported schema"):
             client.generate("prompt", max_new_tokens=40, response_schema={})
 
+    def test_transient_errors_wait_and_retry_without_manual_restart(self):
+        client = self.client({})
+        unavailable = MagicMock(ok=False, status_code=503)
+        success = MagicMock(ok=True)
+        success.json.return_value = {"tokens": [1, 2]}
+        client.session.post.side_effect = [requests.Timeout(), unavailable, success]
+        with patch("story_writer.llama_cpp.time.sleep") as wait:
+            self.assertEqual(client.encode("retry text"), [1, 2])
+        self.assertEqual(client.session.post.call_count, 3)
+        self.assertEqual(wait.call_count, 2)
+
     def test_startup_is_private_and_close_only_terminates_owned_process(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -59,18 +71,35 @@ class LlamaCppTests(unittest.TestCase):
             process.poll.return_value = None
             session.get.return_value.status_code = 200
             with patch("config.STORY_LLAMA_SERVER", exe), patch("config.STORY_MODEL_PATH", model), \
-                    patch("config.OUTPUT_DIR", root), \
+                    patch("config.OUTPUT_DIR", root), patch("config.STORY_GPU_LAYERS", 24), \
                     patch("story_writer.llama_cpp.requests.Session", return_value=session), \
                     patch("story_writer.llama_cpp.subprocess.Popen", return_value=process) as popen:
                 client = LlamaCppWriter()
                 client.close()
             command = popen.call_args.args[0]
             self.assertEqual(command[command.index("--host") + 1], "127.0.0.1")
+            self.assertEqual(command[command.index("--n-gpu-layers") + 1], "24")
             self.assertIn('{"enable_thinking":false}', command)
             self.assertFalse(session.trust_env)
             process.terminate.assert_called_once()
             process.kill.assert_not_called()
             session.close.assert_called_once()
+
+    def test_persistent_network_failure_stops_after_three_attempts(self):
+        client = self.client({})
+        client.session.post.side_effect = requests.Timeout()
+        with patch("story_writer.llama_cpp.time.sleep"), self.assertRaisesRegex(RuntimeError, "3 attempts"):
+            client.encode("persistent failure")
+        self.assertEqual(client.session.post.call_count, 3)
+
+    def test_dead_owned_server_does_not_retry_forever(self):
+        client = self.client({})
+        client.process = MagicMock()
+        client.process.poll.return_value = 1
+        client.session.post.side_effect = requests.ConnectionError()
+        with self.assertRaisesRegex(RuntimeError, "1 attempts"):
+            client.encode("dead server")
+        self.assertEqual(client.session.post.call_count, 1)
 
     def test_close_kills_only_its_process_if_termination_times_out(self):
         client = self.client({})

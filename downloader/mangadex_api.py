@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
+import math
 
 import requests
 
@@ -25,7 +26,7 @@ def get(url: str, **kwargs) -> requests.Response:
     headers.setdefault("User-Agent", USER_AGENT)
 
     with _request_lock:
-        while True:
+        for attempt in range(5):
             delay = _next_request - time.monotonic()
             if delay > 0:
                 time.sleep(delay)
@@ -35,12 +36,15 @@ def get(url: str, **kwargs) -> requests.Response:
 
             if response.status_code != 429:
                 return response
+            if attempt == 4:
+                response.raise_for_status()
 
             retry_after = response.headers.get("X-RateLimit-Retry-After")
             try:
                 wait_time = max(float(retry_after) - time.time(), 1.0)
             except (TypeError, ValueError):
                 wait_time = 60.0
+            wait_time = min(wait_time, 300.0) if math.isfinite(wait_time) else 60.0
 
             print(f"MangaDex rate limit reached. Retrying in {wait_time:.1f}s...")
             time.sleep(wait_time)

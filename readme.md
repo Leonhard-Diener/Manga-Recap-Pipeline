@@ -1,6 +1,54 @@
 # Manga Recap Pipeline
 
-The analysis stages are standalone. `old/main.py` is an archived legacy entry
+Run the complete pipeline on existing source pages:
+
+```powershell
+python main.py "Manga title"
+```
+
+This runs panels → Gemini descriptions → ReID → story → TTS/video in separate
+processes, releasing each stage's model before the next. Gemini uses the existing
+runner's configuration (`GEMINI_API_KEY`, default `gemini-3.5-flash-lite` and HIGH
+thinking); there is no automatic provider fallback. Use
+`--description-backend qwen` only to explicitly select the existing local model.
+To download first, add `--download` (MangaDex selection remains interactive).
+To resume after a failed stage, use e.g. `--start-at story`; earlier artifacts
+must already be current. Without a title, the configured title or single input
+folder is used. Per-stage logs are saved under
+`output/<manga>/pipeline_runs/<run>/`; failures stop subsequent stages and return
+the failed exit code. Downloads show page bars per chapter; descriptions show
+completed pages per chapter; story generation shows completed panels. Stage logs
+retain full diagnostics while progress, retry messages, and a 30-second heartbeat
+remain visible in the terminal.
+
+`--stall-timeout 1800` (default: 30 minutes) stops the owned stage process tree
+with exit code 124 if it makes no progress. For descriptions/story, only changed
+completion bars reset the timer, not repeated retry messages; for other stages,
+new log output resets it. Increase this timeout explicitly for very slow hardware.
+This is a watchdog, not proof that every external service can never hang. It does
+not cover the interactive download selection; downloads instead have network
+timeouts, bounded retries, and bounded rate-limit waits. Gemini's unlimited
+transient retries remain unchanged in its standalone runner; the main watchdog
+can stop a prolonged outage. The standalone story writer now stops after four
+failed single-panel retry cycles (at most eight generation requests per failing
+single panel per invocation), preserving checkpoints and raw failures. The local
+story server stops after three failed HTTP attempts. Missing download pages fail
+the stage rather than silently proceeding with an incomplete chapter; newly
+downloaded pages are published atomically.
+
+Existing stage caching/checkpoint policies still apply; not every stage is
+resumable. These changes take effect in newly launched processes, not an already
+running main script. A watchdog can stop a slow but healthy stage; resume from
+the stopped stage after checking its log instead of restarting all stages.
+All `test_*` runners remain available for individual stages. Training-data
+collection and future model/name changes are TODOs, not implemented features.
+Gemini description runs with unresolved pages exit 2 after saving partial output,
+so downstream stages do not run on incomplete evidence. Resume with
+`--start-at description`: current completed pages are reused and unresolved pages
+are retried. A truncated response's single format-repair attempt receives a
+larger token budget, including the provider's reported thinking allowance.
+
+`old/main.py` is an archived legacy entry
 point, not the current workflow. Old backups and stale outputs are in `old/`;
 see `old/README.md` for the archive contents.
 
@@ -16,6 +64,31 @@ see `old/README.md` for the archive contents.
    visual groups, permitted names, grounded actions, and accepted form changes.
 5. **Story writer** (`story_writer/`) — text-only Qwen generation turns the
    accepted evidence into a resumable panel-by-panel recap.
+
+## Render a saved story as video (Windows)
+
+After the story writer has finished, run:
+
+```powershell
+python test_video.py "Manga title"
+```
+
+Requires FFmpeg on `PATH` and an installed Windows English voice (default:
+`Microsoft David Desktop`; select another with `--voice`). Speech is generated
+offline without an API or model run. Narration is read verbatim from the saved
+`*_story.json`, paired with the matching `*_panel_timeline.json`.
+
+The 1920×1080 MP4 has solid white backgrounds for monochrome manga, solid
+colour-matched backgrounds for colour art, and small borders. Panels are fitted,
+not cropped or stretched. Aspect-aware panel pairs remain together throughout
+their combined speech; scene changes follow actual WAV durations, to the nearest
+video frame (30 fps), not estimated reading speed.
+
+Each render is saved in `output/<manga>/video_runs/<run>/recap.mp4`, alongside
+frames, narration WAV, actual audio timeline and logs. Cached segment speech in
+`video_tts/` is reused only for the same text and voice. Earlier videos and story
+outputs are not overwritten. Built-in Windows voices are functional, not
+studio-quality narration. No music or subtitles are added.
 
 ## Setup
 
@@ -174,3 +247,26 @@ rewrite accepted story facts.
 - Magenta: text detection
 - Cyan: body/character detection
 - Lime: final crop
+# Optional YouTube uploads
+
+See [YOUTUBE_UPLOAD.md](YOUTUBE_UPLOAD.md) for Google account setup and commands.
+Edit `youtube_upload.json` to choose title, description, audience, and visibility
+(**private** by default). `python main.py "Manga title" --upload` uploads the newly
+rendered video; without `--upload`, behavior is unchanged. For an existing chapter
+video, use `python test_upload.py "path/to/recap.mp4" --title "Manga - Chapter 1"`.
+Add `--dry-run` to preview without sending anything to YouTube.
+
+## Narration style
+
+The story CLI now defaults to page-level scene prose, keeping all panels in the
+timeline/video without forcing a spoken caption over each one. Use
+`python test_write_storry.py "Manga title" --style panel` for the legacy per-panel
+mode. New style fingerprints archive incompatible story outputs rather than
+silently treating older narration as regenerated. Source pages, evidence and
+previous videos remain unchanged. Scene audio uses measured TTS duration shared
+across the page's panels; it is not word-exact panel synchronization.
+
+`config.STORY_GPU_LAYERS` defaults to 24 to leave VRAM headroom on the 8GB GTX 1080.
+This keeps the same story model, with remaining layers running on CPU. It may be
+slower than full offloading; it does not change evidence/acceptance rules or
+invalidate already accepted narration. Actual offloading is recorded in attempt metrics.

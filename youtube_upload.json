@@ -1,0 +1,9 @@
+{
+  "title": "{title} - Manga Recap",
+  "description": "Business Email: empire.for.manga@gmail.com\n\nName: {title}",
+  "tags": ["manga recap"],
+  "category_id": "24",
+  "privacy_status": "unlisted",
+  "notify_subscribers": false,
+  "made_for_kids": false
+}
